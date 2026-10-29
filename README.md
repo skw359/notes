@@ -1,7 +1,6 @@
 # Notes
 
 [![CI](https://github.com/skw359/notes/actions/workflows/ci.yml/badge.svg)](https://github.com/skw359/notes/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/github/package-json/v/skw359/notes?filename=server%2Fpackage.json)](server/package.json)
 
 A self-hosted notes app with end-to-end encryption. Notes, attachments, and profile data are encrypted in the browser before they reach the server, so the server only stores ciphertext.
 
