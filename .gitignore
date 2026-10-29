@@ -1,0 +1,23 @@
+# Dependencies & builds
+node_modules/
+dist/
+dist-ssr/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Personal data: Apple Notes export, generated import dump, user content
+iCloud/
+server/import-notes.sql
+server/import-backups/
+server/uploads/
+server/storage/
+
+# Local tooling / OS cruft
+.claude/
+.DS_Store
+*.log
+.vscode/
+.idea/
