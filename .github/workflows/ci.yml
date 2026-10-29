@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  client:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  server:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      JWT_SECRET: ci-only-secret
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_HOST: localhost
+      DB_NAME: notes_app
+      PORT: 3004
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - name: Check syntax
+        run: for f in $(git ls-files '*.js'); do node --check "$f"; done
+      - name: Create database
+        run: psql -h localhost -U postgres -v ON_ERROR_STOP=1 -f init.sql
+      - name: Smoke test
+        run: |
+          node index.js > server.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null -X POST localhost:3004/api/auth/prelogin \
+              -H 'Content-Type: application/json' -d '{"email":"ci@example.com"}' && break
+            sleep 1
+          done
+          curl -sf -X POST localhost:3004/api/auth/prelogin \
+            -H 'Content-Type: application/json' -d '{"email":"ci@example.com"}' | grep -q '"authMode":"e2ee"'
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:3004/api/auth/me)" = 401
+      - name: Server log
+        if: always()
+        run: cat server.log || true
