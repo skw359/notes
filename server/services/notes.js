@@ -403,7 +403,9 @@ export async function saveEncryptedNote(pool, config, user, sessionId, noteId, i
     if (staleKey(encryptedContent) || staleKey(encryptedSummary)) {
       return reject('KEY_ROTATED', 'The encryption key changed on another device. Unlock again to continue.', 'key-rotated');
     }
-    if (current.deleted_at) {
+    // Re-encryption (format upgrade, key rotation) must also reach notes in
+    // the trash; it leaves them there.
+    if (current.deleted_at && reason !== 'reencrypt') {
       return reject('NOTE_TRASHED', 'This note was moved to the trash on another device.', 'trashed');
     }
 

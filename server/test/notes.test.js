@@ -408,3 +408,30 @@ describe('summary repair (DATA-8)', () => {
     expect(decryptJson(account.vaultKey, row.encrypted_summary)).toEqual({ title: 'repaired', preview: '' });
   });
 });
+
+describe('re-encryption reaches notes in the trash', () => {
+  it('accepts a reencrypt save on a trashed note and keeps it trashed; edits stay refused', async () => {
+    const { agent, account } = await signupUser(t.app);
+    const note = await createEncryptedNote(agent, account, 'binned');
+    await agent.put(`/api/notes/${note.id}/trash`);
+    const trashedAt = (await dbNote(note.id)).deleted_at;
+
+    const edit = await agent.put(`/api/notes/${note.id}`).send({
+      baseRevision: note.revision,
+      encryptedContent: account.noteContent(note.id, docWithText('edited'), note.revision + 1),
+    });
+    expect(edit.status).toBe(409);
+    expect(edit.body.code).toBe('NOTE_TRASHED');
+
+    const reencrypted = await agent.put(`/api/notes/${note.id}`).send({
+      baseRevision: note.revision,
+      encryptedContent: account.noteContent(note.id, docWithText('binned'), note.revision + 1),
+      reason: 'reencrypt',
+    });
+    expect(reencrypted.status).toBe(200);
+    const row = await dbNote(note.id);
+    expect(row.revision).toBe(note.revision + 1);
+    expect(row.deleted_at).toEqual(trashedAt);
+    expect(decryptJson(account.vaultKey, row.encrypted_content)).toEqual(docWithText('binned'));
+  });
+});
