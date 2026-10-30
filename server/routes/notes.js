@@ -1,291 +1,253 @@
 import { Router } from 'express';
-import pool from '../db.js';
-import { authenticateToken } from '../middleware/auth.js';
+import { z } from 'zod';
+import { badRequest, conflict } from '../lib/errors.js';
+import { CONTEXTS, idListSchema, idSchema, parseBody, parseEnvelope } from '../lib/validation.js';
+import { currentVaultKeyId } from '../services/accounts.js';
+import {
+  createNote,
+  deleteNotePermanently,
+  getNote,
+  getNotesBatch,
+  getRevision,
+  listNotes,
+  listRevisions,
+  reencryptRevision,
+  resolveConflict,
+  restoreNote,
+  saveEncryptedNote,
+  saveLegacyNote,
+  syncChanges,
+  trashNote,
+  updateSummary,
+} from '../services/notes.js';
 
-const router = Router();
+const listQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(5000).optional(),
+  cursor: z.string().max(512).optional(),
+});
 
-router.use(authenticateToken);
+const syncQuerySchema = z.object({
+  since: z.coerce.number().int().min(0),
+  limit: z.coerce.number().int().min(1).max(5000).default(1000),
+});
 
-async function getAuthMode(userId) {
-  const result = await pool.query('SELECT auth_mode FROM users WHERE id = $1', [userId]);
-  return result.rows[0]?.auth_mode || 'legacy';
+const legacyContentSchema = z.looseObject({ type: z.literal('doc') });
+
+// Imports keep the original dates of the notes they bring in.
+const pastTimestamp = z.iso
+  .datetime({ offset: true })
+  .refine((value) => new Date(value).getTime() <= Date.now() + 60 * 1000, 'Timestamp is in the future');
+
+const encryptedSaveSchema = z.strictObject({
+  baseRevision: z.number().int().min(0).optional(),
+  encryptedContent: z.unknown(),
+  encryptedSummary: z.unknown().optional(),
+  blobIds: idListSchema.optional(),
+  reason: z.enum(['edit', 'restore', 'conflict-resolution', 'import', 'reencrypt']).default('edit'),
+  updatedAt: pastTimestamp.optional(),
+});
+
+const legacySaveSchema = z.strictObject({
+  baseRevision: z.number().int().min(0).optional(),
+  content: legacyContentSchema,
+});
+
+const reencryptRevisionSchema = z.strictObject({
+  encryptedContent: z.unknown(),
+  encryptedSummary: z.unknown().optional(),
+  blobIds: idListSchema.optional(),
+});
+
+function noteIdFrom(req) {
+  return idSchema.parse(req.params.id);
 }
 
-function formatSummaryNote(note, authMode) {
-  if (authMode === 'e2ee') {
-    return {
-      id: note.id,
-      user_id: note.user_id,
-      encrypted_summary: note.encrypted_summary,
-      created_at: note.created_at,
-      updated_at: note.updated_at,
-      deleted_at: note.deleted_at,
-    };
+function assertLegacyContentSize(content, config) {
+  if (Buffer.byteLength(JSON.stringify(content)) > config.limits.noteMaxBytes) {
+    throw badRequest('This note is too large to save', 'PAYLOAD_TOO_LARGE', { limit: config.limits.noteMaxBytes });
   }
-
-  return note;
 }
 
-function formatFullNote(note, authMode) {
-  if (authMode === 'e2ee') {
-    return {
-      id: note.id,
-      user_id: note.user_id,
-      encrypted_summary: note.encrypted_summary,
-      encrypted_content: note.encrypted_content,
-      created_at: note.created_at,
-      updated_at: note.updated_at,
-      deleted_at: note.deleted_at,
-    };
+function parseOptionalSummary(value, noteId, label, keyId) {
+  if (value === undefined || value === null) {
+    return undefined;
   }
-
-  return note;
+  return parseEnvelope(value, { context: CONTEXTS.noteSummary(noteId), label, maxBytes: 64 * 1024, keyId });
 }
 
-function getEncryptedSummaryValue(authMode, encryptedSummary) {
-  if (authMode !== 'e2ee' || typeof encryptedSummary === 'undefined') {
-    return null;
-  }
+export function createNotesRouter(ctx) {
+  const { pool, config, limiters, requireSession } = ctx;
+  const router = Router();
 
-  return JSON.stringify(encryptedSummary);
-}
+  router.use(requireSession, limiters.api);
 
-router.get('/', async (req, res) => {
-  try {
-    const authMode = await getAuthMode(req.user.id);
-    const result = await pool.query(
-      `
-        SELECT id, user_id, content, encrypted_summary, created_at, updated_at, deleted_at
-        FROM notes
-        WHERE user_id = $1 AND deleted_at IS NULL
-        ORDER BY updated_at DESC, created_at DESC, id DESC
-      `,
-      [req.user.id]
+  router.get('/', async (req, res) => {
+    const query = listQuerySchema.parse(req.query);
+    res.json(await listNotes(pool, req.user, { scope: 'active', ...query }));
+  });
+
+  // Listing the trash no longer purges it; expiry is a scheduled job.
+  router.get('/trash', async (req, res) => {
+    const query = listQuerySchema.parse(req.query);
+    res.json(await listNotes(pool, req.user, { scope: 'trash', ...query }));
+  });
+
+  router.get('/sync', async (req, res) => {
+    res.json(await syncChanges(pool, req.user, syncQuerySchema.parse(req.query)));
+  });
+
+  router.post('/batch', async (req, res) => {
+    const { ids } = parseBody(
+      z.strictObject({ ids: z.array(idSchema).min(1).max(config.limits.batchMaxIds) }),
+      req.body
     );
+    res.json(await getNotesBatch(pool, req.user, [...new Set(ids)]));
+  });
 
-    const notes = result.rows.map((note) => formatSummaryNote(note, authMode));
-    res.json({ notes });
-  } catch (err) {
-    console.error('Get notes error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+  router.get('/:id', async (req, res) => {
+    res.json({ note: await getNote(pool, req.user, noteIdFrom(req)) });
+  });
 
-router.get('/trash', async (req, res) => {
-  try {
-    const authMode = await getAuthMode(req.user.id);
-
-    await pool.query(
-      `DELETE FROM notes WHERE user_id = $1 AND deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL '30 days'`,
-      [req.user.id]
-    );
-
-    const result = await pool.query(
-      `
-        SELECT id, user_id, content, encrypted_summary, created_at, updated_at, deleted_at
-        FROM notes
-        WHERE user_id = $1 AND deleted_at IS NOT NULL
-        ORDER BY deleted_at DESC
-      `,
-      [req.user.id]
-    );
-
-    const notes = result.rows.map((note) => formatSummaryNote(note, authMode));
-    res.json({ notes });
-  } catch (err) {
-    console.error('Get trash error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-router.get('/:id', async (req, res) => {
-  try {
-    const authMode = await getAuthMode(req.user.id);
-    const result = await pool.query(
-      `
-        SELECT id, user_id, content, encrypted_content, encrypted_summary, created_at, updated_at, deleted_at
-        FROM notes
-        WHERE id = $1 AND user_id = $2
-      `,
-      [req.params.id, req.user.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Note not found' });
+  router.post('/', async (req, res) => {
+    let content = null;
+    let createdAt;
+    if (req.user.authMode === 'e2ee') {
+      // Encrypted notes are created empty; their ciphertext is bound to the
+      // id and arrives with the first save. A plaintext body here comes from
+      // a stale client (DATA-1).
+      if (req.body?.content !== undefined) {
+        throw conflict('This account is end-to-end encrypted. Reload the app to continue.', 'CLIENT_OUTDATED');
+      }
+      createdAt = parseBody(z.object({ createdAt: pastTimestamp.optional() }), req.body).createdAt;
+    } else {
+      content = parseBody(z.object({ content: legacyContentSchema.optional() }), req.body).content || {
+        type: 'doc',
+        content: [{ type: 'paragraph' }],
+      };
+      assertLegacyContentSize(content, config);
     }
 
-    res.json({ note: formatFullNote(result.rows[0], authMode) });
-  } catch (err) {
-    console.error('Get note error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+    res.status(201).json({ note: await createNote(pool, req.user, { content, config, createdAt }) });
+  });
 
-router.post('/', async (req, res) => {
-  try {
-    const authMode = await getAuthMode(req.user.id);
-    const { content, encryptedContent, encryptedSummary } = req.body;
+  router.put('/:id', async (req, res) => {
+    const noteId = noteIdFrom(req);
 
-    const result = await pool.query(
-      `
-        INSERT INTO notes (user_id, content, encrypted_content, encrypted_summary)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, user_id, content, encrypted_content, encrypted_summary, created_at, updated_at, deleted_at
-      `,
-      [
-        req.user.id,
-        authMode === 'legacy' ? JSON.stringify(content || {}) : null,
-        // e2ee clients may create the row first and attach id-bound
-        // ciphertext via PUT; an empty object is not a valid envelope.
-        authMode === 'e2ee' && encryptedContent ? JSON.stringify(encryptedContent) : null,
-        getEncryptedSummaryValue(authMode, encryptedSummary),
-      ]
+    if (req.user.authMode !== 'e2ee') {
+      const body = parseBody(legacySaveSchema, req.body);
+      assertLegacyContentSize(body.content, config);
+      res.json({ note: await saveLegacyNote(pool, req.user, noteId, body) });
+      return;
+    }
+
+    // DATA-1: an encrypted account must never accept plaintext or a save
+    // without ciphertext; both used to erase the note's only copy.
+    if (req.body?.content !== undefined) {
+      throw conflict('This account is end-to-end encrypted. Reload the app to continue.', 'CLIENT_OUTDATED');
+    }
+    const body = parseBody(encryptedSaveSchema, req.body);
+    if (body.encryptedContent === undefined || body.encryptedContent === null) {
+      throw badRequest('encryptedContent is required', 'INVALID_ENVELOPE');
+    }
+
+    const encryptedContent = parseEnvelope(body.encryptedContent, {
+      context: CONTEXTS.noteContent(noteId),
+      label: 'note content',
+      maxBytes: config.limits.noteMaxBytes,
+      revision: body.baseRevision === undefined ? undefined : body.baseRevision + 1,
+    });
+    const encryptedSummary = parseOptionalSummary(body.encryptedSummary, noteId, 'note summary');
+
+    const result = await saveEncryptedNote(pool, config, req.user, req.session.id, noteId, {
+      baseRevision: body.baseRevision,
+      encryptedContent,
+      encryptedSummary,
+      blobIds: body.blobIds,
+      reason: body.reason,
+      updatedAt: body.reason === 'import' ? body.updatedAt : undefined,
+    });
+
+    if (result.status === 'conflict') {
+      res.status(409).json({
+        error: result.message,
+        code: result.code,
+        conflictRevisionId: result.conflictRevisionId,
+        note: result.note,
+      });
+      return;
+    }
+
+    res.json({ note: result.note, missingBlobIds: result.missingBlobIds });
+  });
+
+  router.patch('/:id/summary', async (req, res) => {
+    if (req.user.authMode !== 'e2ee') {
+      throw badRequest('Encrypted summaries are unavailable for legacy accounts');
+    }
+    const noteId = noteIdFrom(req);
+    const { encryptedSummary, revision } = parseBody(
+      z.strictObject({ encryptedSummary: z.unknown(), revision: z.number().int().min(0).optional() }),
+      req.body
     );
-
-    res.status(201).json({ note: formatSummaryNote(result.rows[0], authMode) });
-  } catch (err) {
-    console.error('Create note error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-router.put('/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const authMode = await getAuthMode(req.user.id);
-    const { content, encryptedContent, encryptedSummary } = req.body;
-
-    const result = await pool.query(
-      `
-        UPDATE notes
-        SET
-          content = $1,
-          encrypted_content = $2,
-          encrypted_summary = CASE
-            WHEN $3::jsonb IS NULL THEN encrypted_summary
-            ELSE $3::jsonb
-          END,
-          updated_at = NOW()
-        WHERE id = $4 AND user_id = $5 AND deleted_at IS NULL
-        RETURNING id, user_id, content, encrypted_content, encrypted_summary, created_at, updated_at, deleted_at
-      `,
-      [
-        authMode === 'legacy' ? JSON.stringify(content || {}) : null,
-        authMode === 'e2ee' && encryptedContent ? JSON.stringify(encryptedContent) : null,
-        getEncryptedSummaryValue(authMode, encryptedSummary),
-        id,
-        req.user.id,
-      ]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Note not found' });
+    const keyId = await currentVaultKeyId(pool, req.user.id);
+    const envelope = parseOptionalSummary(encryptedSummary, noteId, 'note summary', keyId);
+    if (!envelope) {
+      throw badRequest('encryptedSummary is required', 'INVALID_ENVELOPE');
     }
+    // `revision`: the summary was derived from that revision's content and
+    // must not land on a newer one.
+    res.json({ note: await updateSummary(pool, req.user, noteId, envelope, { revision }) });
+  });
 
-    res.json({ note: formatSummaryNote(result.rows[0], authMode) });
-  } catch (err) {
-    console.error('Update note error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+  router.put('/:id/trash', async (req, res) => {
+    res.json({ message: 'Note moved to trash', note: await trashNote(pool, req.user, noteIdFrom(req)) });
+  });
 
-router.patch('/:id/summary', async (req, res) => {
-  try {
-    const authMode = await getAuthMode(req.user.id);
-    if (authMode !== 'e2ee') {
-      return res.status(400).json({ error: 'Encrypted summaries are unavailable for legacy accounts' });
-    }
+  router.put('/:id/restore', async (req, res) => {
+    res.json({ note: await restoreNote(pool, req.user, noteIdFrom(req)) });
+  });
 
-    const { encryptedSummary } = req.body;
-    if (!encryptedSummary) {
-      return res.status(400).json({ error: 'Encrypted summary is required' });
-    }
-
-    const result = await pool.query(
-      `
-        UPDATE notes
-        SET encrypted_summary = $1
-        WHERE id = $2 AND user_id = $3
-        RETURNING id, user_id, encrypted_summary, created_at, updated_at, deleted_at
-      `,
-      [JSON.stringify(encryptedSummary), req.params.id, req.user.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Note not found' });
-    }
-
-    res.json({ note: formatSummaryNote(result.rows[0], authMode) });
-  } catch (err) {
-    console.error('Patch summary error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-router.put('/:id/trash', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const result = await pool.query(
-      `
-        UPDATE notes SET deleted_at = NOW()
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-        RETURNING id
-      `,
-      [id, req.user.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Note not found' });
-    }
-
-    res.json({ message: 'Note moved to trash' });
-  } catch (err) {
-    console.error('Trash note error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-router.put('/:id/restore', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const authMode = await getAuthMode(req.user.id);
-    const result = await pool.query(
-      `
-        UPDATE notes SET deleted_at = NULL, updated_at = NOW()
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL
-        RETURNING id, user_id, content, encrypted_summary, encrypted_content, created_at, updated_at, deleted_at
-      `,
-      [id, req.user.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Note not found' });
-    }
-
-    res.json({ note: formatSummaryNote(result.rows[0], authMode) });
-  } catch (err) {
-    console.error('Restore note error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-router.delete('/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const result = await pool.query(
-      'DELETE FROM notes WHERE id = $1 AND user_id = $2 RETURNING id',
-      [id, req.user.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Note not found' });
-    }
-
+  router.delete('/:id', async (req, res) => {
+    await deleteNotePermanently(pool, req.user, noteIdFrom(req));
     res.json({ message: 'Note deleted' });
-  } catch (err) {
-    console.error('Delete note error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+  });
 
-export default router;
+  router.get('/:id/revisions', async (req, res) => {
+    res.json({ revisions: await listRevisions(pool, req.user, noteIdFrom(req)) });
+  });
+
+  router.get('/:id/revisions/:revisionId', async (req, res) => {
+    const revisionId = idSchema.parse(req.params.revisionId);
+    res.json({ revision: await getRevision(pool, req.user, noteIdFrom(req), revisionId) });
+  });
+
+  router.post('/:id/revisions/:revisionId/resolve', async (req, res) => {
+    const revisionId = idSchema.parse(req.params.revisionId);
+    res.json({ revision: await resolveConflict(pool, req.user, noteIdFrom(req), revisionId) });
+  });
+
+  // Key rotation / format upgrade re-encrypts history in place.
+  router.put('/:id/revisions/:revisionId', async (req, res) => {
+    if (req.user.authMode !== 'e2ee') {
+      throw badRequest('Revisions are only kept for encrypted accounts');
+    }
+    const noteId = noteIdFrom(req);
+    const revisionId = idSchema.parse(req.params.revisionId);
+    const body = parseBody(reencryptRevisionSchema, req.body);
+    const keyId = await currentVaultKeyId(pool, req.user.id);
+    const encryptedContent = parseEnvelope(body.encryptedContent, {
+      context: CONTEXTS.noteContent(noteId),
+      label: 'revision content',
+      maxBytes: config.limits.noteMaxBytes,
+      keyId,
+    });
+    await reencryptRevision(pool, req.user, noteId, revisionId, {
+      encryptedContent,
+      encryptedSummary: parseOptionalSummary(body.encryptedSummary, noteId, 'revision summary', keyId),
+      blobIds: body.blobIds,
+    });
+    res.json({ ok: true });
+  });
+
+  return router;
+}

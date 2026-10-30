@@ -1,760 +1,512 @@
 /* eslint-disable react-refresh/only-export-components */
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
-import {
-  CONTEXTS,
-  MIN_PASSWORD_LENGTH,
-  createVaultBootstrap,
-  decodeBase64,
-  decryptBytes,
-  decryptJson,
-  decryptProfile,
-  derivePasswordMaterial,
-  deriveRecoveryVerifier,
-  encodeBase64,
-  encryptBytes,
-  encryptJson,
-  encryptProfile,
-  unlockVaultWithPassword,
-  unlockVaultWithRecoveryKey,
-} from '../lib/e2ee.js'
-import {
-  createNoteSummary,
-  extractBlobIdsFromContent,
-  migrateLegacyContent,
-  normalizeContentForStorage,
-} from '../lib/noteContent.js'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import * as account from '../lib/account.js'
+import { api, onApiEvent } from '../lib/api.js'
+import { createAttachmentResolver, uploadFile } from '../lib/attachments.js'
+import { getDeviceSettings, setDeviceSettings } from '../lib/deviceSettings.js'
+import { prepareKeyRotation, reencryptVault } from '../lib/keyRotation.js'
+import { migrateLegacyAccount } from '../lib/legacyMigration.js'
+import { clearUserData, countOutboxEntries } from '../lib/persistentNoteCache.js'
 
-const AuthContext = createContext()
+const AuthContext = createContext(null)
 
-async function parseJsonResponse(res) {
-  try {
-    return await res.json()
-  } catch {
-    return null
-  }
-}
+const EMPTY_PROFILE = { first_name: '', last_name: '', profile_picture_blob_id: null }
 
-function createObjectUrl(bytes, mimeType) {
-  return URL.createObjectURL(new Blob([bytes], { type: mimeType || 'application/octet-stream' }))
+function pictureReference(profile) {
+  return profile?.profile_picture_blob_id
+    ? {
+        blobId: String(profile.profile_picture_blob_id),
+        blobUuid: profile.profile_picture_blob_uuid || null,
+        blobVersion: profile.profile_picture_blob_version || null,
+        keyId: profile.profile_picture_key_id || null,
+        mimeType: profile.profile_picture_mime_type || 'image/jpeg',
+      }
+    : null
 }
 
 export function AuthProvider({ children }) {
-  const [sessionUser, setSessionUser] = useState(null)
   const [loading, setLoading] = useState(true)
-  const [vaultBootstrap, setVaultBootstrap] = useState(null)
-  const [encryptedProfileValue, setEncryptedProfileValue] = useState(null)
+  const [session, setSession] = useState(null)
+  const [vault, setVault] = useState(null)
   const [profile, setProfile] = useState(null)
-  const [pendingRecoveryKey, setPendingRecoveryKey] = useState(null)
+  const [pictureUrl, setPictureUrl] = useState(null)
+  const [sessionExpired, setSessionExpired] = useState(false)
+  const [recoveryPrompt, setRecoveryPrompt] = useState(null)
+  const [deviceSettings, setDeviceSettingsState] = useState(getDeviceSettings)
+  const [lockNotice, setLockNotice] = useState(null)
+  // DATA-5: a legacy user may postpone the upgrade (or retry it after a
+  // failure) and keep using the app instead of being logged out.
+  const [upgradeDeferred, setUpgradeDeferred] = useState(false)
 
-  const mountedRef = useRef(true)
-  const vaultKeyRef = useRef(null)
-  const blobUrlCacheRef = useRef(new Map())
-
-  const revokeBlobUrl = useCallback((blobId) => {
-    const cached = blobUrlCacheRef.current.get(String(blobId))
-    if (cached?.url) {
-      URL.revokeObjectURL(cached.url)
-    }
-    blobUrlCacheRef.current.delete(String(blobId))
-  }, [])
-
-  const clearBlobUrlCache = useCallback(() => {
-    for (const { url } of blobUrlCacheRef.current.values()) {
-      if (url) {
-        URL.revokeObjectURL(url)
-      }
-    }
-    blobUrlCacheRef.current.clear()
-  }, [])
-
-  const clearVaultState = useCallback(() => {
-    vaultKeyRef.current = null
-    clearBlobUrlCache()
-    setVaultBootstrap(null)
-    setEncryptedProfileValue(null)
-    setProfile(null)
-  }, [clearBlobUrlCache])
-
-  async function requestJson(url, options = {}) {
-    const res = await fetch(url, {
-      credentials: 'include',
-      ...options,
-    })
-    const data = await parseJsonResponse(res)
-    if (!res.ok) {
-      throw new Error(data?.error || 'Request failed')
-    }
-    return data
-  }
-
-  async function resolveEncryptedBlobUrl(blobId, mimeTypeHint, signal) {
-    const cacheKey = String(blobId)
-    if (blobUrlCacheRef.current.has(cacheKey)) {
-      return blobUrlCacheRef.current.get(cacheKey).url
-    }
-
-    if (!vaultKeyRef.current) {
-      throw new Error('Vault is locked')
-    }
-
-    const res = await fetch(`/api/blobs/${blobId}`, {
-      credentials: 'include',
-      signal,
-    })
-    if (!res.ok) {
-      const data = await parseJsonResponse(res)
-      throw new Error(data?.error || 'Failed to load encrypted file')
-    }
-
-    const cipherBytes = new Uint8Array(await res.arrayBuffer())
-    const envelope = {
-      version: parseInt(res.headers.get('x-blob-version') || '1', 10),
-      algorithm: res.headers.get('x-blob-algorithm') || 'AES-256-GCM',
-      context: CONTEXTS.blob,
-      iv: res.headers.get('x-blob-iv'),
-      ciphertext: encodeBase64(cipherBytes),
-    }
-
-    // Prefer the mime type carried inside encrypted data (note attrs /
-    // profile) over the server-visible header, which is generic for new blobs.
-    const mimeType = mimeTypeHint || res.headers.get('x-blob-mime-type') || 'application/octet-stream'
-    const plaintextBytes = await decryptBytes(vaultKeyRef.current, envelope, CONTEXTS.blob)
-    const url = createObjectUrl(plaintextBytes, mimeType)
-
-    blobUrlCacheRef.current.set(cacheKey, { url, mimeType })
-    return url
-  }
-
-  async function materializeProfile(decryptedProfile) {
-    if (!decryptedProfile) {
-      return null
-    }
-
-    if (decryptedProfile.profile_picture_blob_id) {
-      return {
-        ...decryptedProfile,
-        profile_picture: await resolveEncryptedBlobUrl(
-          decryptedProfile.profile_picture_blob_id,
-          decryptedProfile.profile_picture_mime_type
-        ),
-      }
-    }
-
-    return {
-      ...decryptedProfile,
-      profile_picture: null,
-    }
-  }
-
-  async function adoptUnlockedE2EE(payload, vaultKey) {
-    vaultKeyRef.current = vaultKey
-    setSessionUser(payload.user)
-    setVaultBootstrap(payload.vaultBootstrap)
-    setEncryptedProfileValue(payload.encryptedProfile)
-
-    const decryptedProfile = payload.encryptedProfile
-      ? await decryptProfile(vaultKey, payload.encryptedProfile)
-      : { first_name: '', last_name: '', profile_picture_blob_id: null, profile_picture_mime_type: null }
-    const hydratedProfile = await materializeProfile(decryptedProfile)
-
-    if (mountedRef.current) {
-      setProfile(hydratedProfile)
-    }
-  }
-
-  const adoptLockedE2EE = useCallback((payload) => {
-    clearVaultState()
-    setSessionUser(payload.user)
-    setVaultBootstrap(payload.vaultBootstrap)
-    setEncryptedProfileValue(payload.encryptedProfile)
-  }, [clearVaultState])
-
-  const adoptLegacySession = useCallback((user) => {
-    clearVaultState()
-    setSessionUser(user)
-  }, [clearVaultState])
-
-  async function uploadEncryptedBlobData({ bytes, mimeType }) {
-    if (!vaultKeyRef.current) {
-      throw new Error('Unlock the vault first')
-    }
-
-    const envelope = await encryptBytes(vaultKeyRef.current, bytes, CONTEXTS.blob)
-    // The real mime type and purpose stay inside encrypted content; the
-    // server only ever sees generic blob metadata.
-    const res = await fetch('/api/blobs', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/octet-stream',
-        'X-Blob-IV': envelope.iv,
-        'X-Blob-Kind': 'blob',
-        'X-Blob-Mime-Type': 'application/octet-stream',
-        'X-Blob-Algorithm': envelope.algorithm,
-        'X-Blob-Version': String(envelope.version),
-      },
-      body: decodeBase64(envelope.ciphertext),
-    })
-
-    const data = await parseJsonResponse(res)
-    if (!res.ok) {
-      throw new Error(data?.error || 'Failed to upload encrypted file')
-    }
-
-    const blobId = String(data.blob.id)
-    const url = createObjectUrl(bytes, mimeType)
-    blobUrlCacheRef.current.set(blobId, { url, mimeType })
-
-    return {
-      blobId,
-      mimeType,
-      url,
-    }
-  }
-
-  async function uploadEncryptedBlob(file) {
-    const bytes = new Uint8Array(await file.arrayBuffer())
-    const mimeType = file.type || 'application/octet-stream'
-    return uploadEncryptedBlobData({ bytes, mimeType })
-  }
-
-  async function deleteBlob(blobId) {
-    if (!blobId) {
-      return
-    }
-
-    try {
-      await fetch(`/api/blobs/${blobId}`, {
-        method: 'DELETE',
-        credentials: 'include',
-      })
-    } finally {
-      revokeBlobUrl(blobId)
-    }
-  }
-
-  function requireNoteId(noteId) {
-    if (noteId === null || typeof noteId === 'undefined' || noteId === '') {
-      throw new Error('A note id is required to bind encrypted data')
-    }
-    return String(noteId)
-  }
-
-  async function encryptNoteContent(content, noteId) {
-    if (!vaultKeyRef.current) {
-      throw new Error('Unlock the vault first')
-    }
-
-    const normalizedContent = normalizeContentForStorage(content)
-    return encryptJson(vaultKeyRef.current, normalizedContent, CONTEXTS.noteContent(requireNoteId(noteId)))
-  }
-
-  async function decryptNoteContent(note) {
-    if (!note?.encrypted_content) {
-      return note?.content || null
-    }
-
-    if (!vaultKeyRef.current) {
-      throw new Error('Unlock the vault first')
-    }
-
-    return decryptJson(
-      vaultKeyRef.current,
-      note.encrypted_content,
-      CONTEXTS.noteContent(requireNoteId(note.id))
-    )
-  }
-
-  async function encryptNoteSummary(summary, noteId) {
-    if (!vaultKeyRef.current) {
-      throw new Error('Unlock the vault first')
-    }
-
-    return encryptJson(vaultKeyRef.current, summary, CONTEXTS.noteSummary(requireNoteId(noteId)))
-  }
-
-  async function decryptNoteSummary(encryptedSummary, noteId) {
-    if (!encryptedSummary) {
-      return null
-    }
-
-    if (!vaultKeyRef.current) {
-      throw new Error('Unlock the vault first')
-    }
-
-    return decryptJson(
-      vaultKeyRef.current,
-      encryptedSummary,
-      CONTEXTS.noteSummary(requireNoteId(noteId))
-    )
-  }
-
-  async function encryptNoteSearchText(noteId, value) {
-    if (!vaultKeyRef.current) {
-      throw new Error('Unlock the vault first')
-    }
-
-    return encryptJson(vaultKeyRef.current, value, CONTEXTS.noteSearch(requireNoteId(noteId)))
-  }
-
-  async function decryptNoteSearchText(noteId, encryptedValue) {
-    if (!encryptedValue) {
-      return null
-    }
-
-    if (!vaultKeyRef.current) {
-      throw new Error('Unlock the vault first')
-    }
-
-    return decryptJson(
-      vaultKeyRef.current,
-      encryptedValue,
-      CONTEXTS.noteSearch(requireNoteId(noteId))
-    )
-  }
-
-  async function migrateLegacyBlob(filename) {
-    const res = await fetch(`/api/legacy-uploads/${encodeURIComponent(filename)}`, {
-      credentials: 'include',
-    })
-
-    if (!res.ok) {
-      const data = await parseJsonResponse(res)
-      throw new Error(data?.error || 'Failed to load legacy file')
-    }
-
-    const bytes = new Uint8Array(await res.arrayBuffer())
-    const mimeType = res.headers.get('content-type') || 'application/octet-stream'
-    return uploadEncryptedBlobData({ bytes, mimeType })
-  }
-
-  async function migrateLegacyAccount({ legacyUser, password }) {
-    const notesPayload = await requestJson('/api/notes')
-    const bootstrap = await createVaultBootstrap(password)
-
-    vaultKeyRef.current = bootstrap.vaultKey
-
-    const migratedNotes = await Promise.all(
-      (notesPayload.notes || []).map(async (note) => {
-        const migratedContent = await migrateLegacyContent(note.content, (filename) =>
-          migrateLegacyBlob(filename)
-        )
-        const normalizedContent = normalizeContentForStorage(migratedContent)
-
-        return {
-          id: note.id,
-          encryptedContent: await encryptJson(
-            bootstrap.vaultKey,
-            normalizedContent,
-            CONTEXTS.noteContent(String(note.id))
-          ),
-          encryptedSummary: await encryptJson(
-            bootstrap.vaultKey,
-            createNoteSummary(normalizedContent),
-            CONTEXTS.noteSummary(String(note.id))
-          ),
-        }
-      })
-    )
-
-    let profilePictureBlob = null
-    if (legacyUser.profile_picture) {
-      profilePictureBlob = await migrateLegacyBlob(legacyUser.profile_picture)
-    }
-
-    const encryptedProfile = await encryptProfile(bootstrap.vaultKey, {
-      first_name: legacyUser.first_name || '',
-      last_name: legacyUser.last_name || '',
-      profile_picture_blob_id: profilePictureBlob?.blobId || null,
-      profile_picture_mime_type: profilePictureBlob?.mimeType || null,
-    })
-
-    const migratedPayload = await requestJson('/api/auth/migrate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        authSalt: bootstrap.authSalt,
-        kdfParams: bootstrap.kdfParams,
-        authVerifier: bootstrap.authVerifier,
-        recoveryVerifier: bootstrap.recoveryVerifier,
-        wrappedVaultKey: bootstrap.wrappedVaultKey,
-        wrappedVaultKeyRecovery: bootstrap.wrappedVaultKeyRecovery,
-        encryptedProfile,
-        notes: migratedNotes,
-      }),
-    })
-
-    await adoptUnlockedE2EE(migratedPayload, bootstrap.vaultKey)
-    setPendingRecoveryKey(bootstrap.recoveryKey)
-
-    return {
-      user: migratedPayload.user,
-      migrated: true,
-      recoveryKey: bootstrap.recoveryKey,
-    }
-  }
+  const vaultRef = useRef(null)
+  const sessionRef = useRef(null)
+  const lockHandlers = useRef(new Set())
+  const resumeHandlers = useRef(new Set())
+  const attachments = useMemo(() => createAttachmentResolver({ api }), [])
 
   useEffect(() => {
-    mountedRef.current = true
+    vaultRef.current = vault
+  }, [vault])
+  useEffect(() => {
+    sessionRef.current = session
+  }, [session])
 
-    async function checkAuth() {
+  // ── recovery key acknowledgement (CRYPTO-2 / CRYPTO-4) ────────────────
+  const requestRecoveryAcknowledgement = useCallback(
+    (key, purpose, { cancellable = false } = {}) =>
+      new Promise((resolve, reject) => {
+        setRecoveryPrompt({
+          key,
+          purpose,
+          cancellable,
+          confirm: () => {
+            setRecoveryPrompt(null)
+            resolve()
+          },
+          cancel: () => {
+            setRecoveryPrompt(null)
+            reject(new Error('Cancelled. Nothing was changed.'))
+          },
+        })
+      }),
+    []
+  )
+
+  // ── session helpers ───────────────────────────────────────────────────
+  const adoptSessionPayload = useCallback((payload) => {
+    const next = {
+      user: payload.user,
+      authMode: payload.user.auth_mode,
+      bootstrap: payload.vaultBootstrap || null,
+      encryptedProfile: payload.encryptedProfile ?? null,
+      profileBlobId: payload.profileBlobId ?? null,
+      migrationRequired: Boolean(payload.migrationRequired),
+    }
+    sessionRef.current = next
+    setSession(next)
+    setSessionExpired(false)
+  }, [])
+
+  const adoptVault = useCallback(
+    async (nextVault, payload) => {
+      vaultRef.current = nextVault
+      attachments.setVault(nextVault)
+      setVault(nextVault)
+      adoptSessionPayload(payload)
+      setLockNotice(null)
       try {
-        const res = await fetch('/api/auth/me', { credentials: 'include' })
-        if (!res.ok) {
-          return
-        }
-
-        const data = await parseJsonResponse(res)
-        if (data?.user?.auth_mode === 'e2ee') {
-          adoptLockedE2EE(data)
-        } else if (data?.user) {
-          adoptLegacySession(data.user)
-        }
+        setProfile(await account.decryptProfile(nextVault, payload.encryptedProfile))
       } catch {
-        // not authenticated
-      } finally {
-        if (mountedRef.current) {
+        setProfile({ ...EMPTY_PROFILE })
+      }
+    },
+    [adoptSessionPayload, attachments]
+  )
+
+  const clearVault = useCallback(() => {
+    vaultRef.current?.lock()
+    vaultRef.current = null
+    attachments.setVault(null)
+    setVault(null)
+    setProfile(null)
+    setPictureUrl(null)
+    attachments.clear()
+  }, [attachments])
+
+  // Lets the dashboard persist unsent edits (encrypted) before the key is
+  // dropped. A handler returning false vetoes the lock.
+  const registerLockHandler = useCallback((handler) => {
+    lockHandlers.current.add(handler)
+    return () => lockHandlers.current.delete(handler)
+  }, [])
+
+  const registerResumeHandler = useCallback((handler) => {
+    resumeHandlers.current.add(handler)
+    return () => resumeHandlers.current.delete(handler)
+  }, [])
+
+  const runLockHandlers = useCallback(async () => {
+    for (const handler of lockHandlers.current) {
+      if ((await handler()) === false) {
+        return false
+      }
+    }
+    return true
+  }, [])
+
+  // ── initial load ──────────────────────────────────────────────────────
+  useEffect(() => {
+    let cancelled = false
+    api
+      .get('/api/auth/me')
+      .then((payload) => {
+        if (!cancelled) {
+          adoptSessionPayload(payload)
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) {
           setLoading(false)
         }
-      }
-    }
-
-    checkAuth()
-
-    return () => {
-      mountedRef.current = false
-      clearBlobUrlCache()
-    }
-  }, [adoptLegacySession, adoptLockedE2EE, clearBlobUrlCache])
-
-  function assertPasswordStrength(password) {
-    if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
-      throw new Error(`Password must be at least ${MIN_PASSWORD_LENGTH} characters long`)
-    }
-  }
-
-  async function signup(email, first_name, last_name, password) {
-    assertPasswordStrength(password)
-    const bootstrap = await createVaultBootstrap(password)
-    const encryptedProfile = await encryptProfile(bootstrap.vaultKey, {
-      first_name,
-      last_name,
-      profile_picture_blob_id: null,
-      profile_picture_mime_type: null,
-    })
-
-    const data = await requestJson('/api/auth/signup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email,
-        authSalt: bootstrap.authSalt,
-        kdfParams: bootstrap.kdfParams,
-        authVerifier: bootstrap.authVerifier,
-        recoveryVerifier: bootstrap.recoveryVerifier,
-        wrappedVaultKey: bootstrap.wrappedVaultKey,
-        wrappedVaultKeyRecovery: bootstrap.wrappedVaultKeyRecovery,
-        encryptedProfile,
-      }),
-    })
-
-    await adoptUnlockedE2EE(data, bootstrap.vaultKey)
-    setPendingRecoveryKey(bootstrap.recoveryKey)
-    return { user: data.user, recoveryKey: bootstrap.recoveryKey }
-  }
-
-  async function login(email, password) {
-    const prelogin = await requestJson('/api/auth/prelogin', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email }),
-    })
-
-    if (prelogin.authMode === 'e2ee') {
-      // Prelogin only supplies salt + KDF params; the wrapped vault key is
-      // released by the server after the auth verifier checks out.
-      const { authSecret, keyEncryptionKey } = await derivePasswordMaterial(
-        password,
-        prelogin.salt,
-        prelogin.kdfParams
-      )
-
-      const data = await requestJson('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, authSecret }),
       })
-
-      let vaultKey
-
-      try {
-        vaultKey = await decryptBytes(
-          keyEncryptionKey,
-          data.vaultBootstrap.wrappedVaultKey,
-          CONTEXTS.vaultKeyPassword
-        )
-      } catch {
-        throw new Error('Unable to unlock the vault with this password')
-      }
-
-      await adoptUnlockedE2EE(data, vaultKey)
-      return { user: data.user }
+    return () => {
+      cancelled = true
     }
+  }, [adoptSessionPayload])
 
-    const data = await requestJson('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }),
-    })
-
-    adoptLegacySession(data.user)
-
-    try {
-      return await migrateLegacyAccount({ legacyUser: data.user, password })
-    } catch (error) {
-      await logout()
-      throw new Error(`Legacy account migration failed: ${error.message}`)
-    }
-  }
-
-  // Covers state (b) "authenticated + vault locked" -> (c) "authenticated +
-  // vault open".
-  async function unlockVault(password) {
-    if (!vaultBootstrap || !encryptedProfileValue) {
-      throw new Error('No encrypted vault is available')
-    }
-
-    let vaultKey
-
-    try {
-      const unlocked = await unlockVaultWithPassword(password, vaultBootstrap)
-      vaultKey = unlocked.vaultKey
-    } catch {
-      throw new Error('Invalid password')
-    }
-
-    await adoptUnlockedE2EE(
-      {
-        user: sessionUser,
-        vaultBootstrap,
-        encryptedProfile: encryptedProfileValue,
-      },
-      vaultKey
-    )
-  }
-
-  async function recoverAccount(email, recoveryKey, newPassword) {
-    assertPasswordStrength(newPassword)
-
-    // The raw recovery key never leaves this device: the server sees only a
-    // one-way verifier, and releases the recovery-wrapped vault key after
-    // that verifier checks out.
-    const derivedVerifier = await deriveRecoveryVerifier(recoveryKey)
-
-    const begin = await requestJson('/api/auth/recover/begin', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, recoveryVerifier: derivedVerifier }),
-    })
-
-    let vaultKey
-
-    try {
-      vaultKey = await unlockVaultWithRecoveryKey(recoveryKey, begin.wrappedVaultKeyRecovery)
-    } catch {
-      throw new Error('Invalid recovery key')
-    }
-
-    const bootstrap = await createVaultBootstrap(newPassword, vaultKey)
-
-    const data = await requestJson('/api/auth/recover', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email,
-        recoveryVerifier: derivedVerifier,
-        authSalt: bootstrap.authSalt,
-        kdfParams: bootstrap.kdfParams,
-        authVerifier: bootstrap.authVerifier,
-        nextRecoveryVerifier: bootstrap.recoveryVerifier,
-        wrappedVaultKey: bootstrap.wrappedVaultKey,
-        wrappedVaultKeyRecovery: bootstrap.wrappedVaultKeyRecovery,
-      }),
-    })
-
-    await adoptUnlockedE2EE(data, vaultKey)
-    setPendingRecoveryKey(bootstrap.recoveryKey)
-    return { user: data.user, recoveryKey: bootstrap.recoveryKey }
-  }
-
-  async function rekeyVault(currentPassword, newPassword) {
-    if (!vaultBootstrap || !vaultKeyRef.current) {
-      throw new Error('Unlock the vault first')
-    }
-
-    assertPasswordStrength(newPassword)
-
-    let currentAuthSecret
-
-    try {
-      const unlocked = await unlockVaultWithPassword(currentPassword, vaultBootstrap)
-      currentAuthSecret = unlocked.authSecret
-    } catch {
-      throw new Error('Invalid current password')
-    }
-
-    const bootstrap = await createVaultBootstrap(newPassword, vaultKeyRef.current)
-
-    const data = await requestJson('/api/auth/rekey', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        currentAuthSecret,
-        authSalt: bootstrap.authSalt,
-        kdfParams: bootstrap.kdfParams,
-        authVerifier: bootstrap.authVerifier,
-        nextRecoveryVerifier: bootstrap.recoveryVerifier,
-        wrappedVaultKey: bootstrap.wrappedVaultKey,
-        wrappedVaultKeyRecovery: bootstrap.wrappedVaultKeyRecovery,
-      }),
-    })
-
-    await adoptUnlockedE2EE(data, vaultKeyRef.current)
-    setPendingRecoveryKey(bootstrap.recoveryKey)
-    return bootstrap.recoveryKey
-  }
-
-  async function logout() {
-    await fetch('/api/auth/logout', {
-      method: 'POST',
-      credentials: 'include',
-    })
-
-    clearVaultState()
-    setSessionUser(null)
-  }
-
-  async function saveProfile({ firstName, lastName, file }) {
-    if (sessionUser?.auth_mode !== 'e2ee') {
-      throw new Error('Encrypted profile updates are unavailable')
-    }
-
-    if (!vaultKeyRef.current) {
-      throw new Error('Unlock the vault first')
-    }
-
-    const currentProfile = profile || {
-      first_name: '',
-      last_name: '',
-      profile_picture_blob_id: null,
-      profile_picture_mime_type: null,
-      profile_picture: null,
-    }
-
-    let previousProfilePictureBlobId = null
-    let nextProfile = {
-      ...currentProfile,
-      first_name: firstName,
-      last_name: lastName,
-    }
-
-    if (file) {
-      const uploadedBlob = await uploadEncryptedBlob(file)
-      previousProfilePictureBlobId = currentProfile.profile_picture_blob_id || null
-      nextProfile = {
-        ...nextProfile,
-        profile_picture_blob_id: uploadedBlob.blobId,
-        profile_picture_mime_type: uploadedBlob.mimeType,
-        profile_picture: uploadedBlob.url,
-      }
-    }
-
-    const encryptedProfile = await encryptProfile(vaultKeyRef.current, {
-      first_name: nextProfile.first_name,
-      last_name: nextProfile.last_name,
-      profile_picture_blob_id: nextProfile.profile_picture_blob_id || null,
-      profile_picture_mime_type: nextProfile.profile_picture_mime_type || null,
-    })
-
-    await requestJson('/api/users/profile', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        encryptedProfile,
-        previousProfilePictureBlobId,
-      }),
-    })
-
-    if (
-      previousProfilePictureBlobId &&
-      previousProfilePictureBlobId !== nextProfile.profile_picture_blob_id
-    ) {
-      revokeBlobUrl(previousProfilePictureBlobId)
-    }
-
-    setEncryptedProfileValue(encryptedProfile)
-    setProfile(nextProfile)
-    return nextProfile
-  }
-
-  function updateUser(updatedUser) {
-    setSessionUser(updatedUser)
-  }
-
-  function dismissRecoveryKey() {
-    setPendingRecoveryKey(null)
-  }
-
-  // ── The three states, named ─────────────────────────────────────────────
-  // (a) not authenticated:            `user` is null (below).
-  // (b) authenticated + vault locked: `vaultLocked` true.
-  // (c) authenticated + vault open:   `vaultLocked` false, vaultKeyRef.current set.
-  const authMode = sessionUser?.auth_mode || null
-  // True whenever we have an e2ee session but no vault key in memory yet;
-  // VaultUnlockScreen prompts from this.
-  const vaultLocked = authMode === 'e2ee' && !vaultKeyRef.current
-  const user = sessionUser
-    ? authMode === 'e2ee'
-      ? {
-          ...sessionUser,
-          ...(profile || {}),
+  // DATA-2: an expired session no longer silently drops saves. With the
+  // vault open, the app asks for the password and keeps everything in place.
+  useEffect(
+    () =>
+      onApiEvent((event) => {
+        if (event.type !== 'unauthorized' || !sessionRef.current) {
+          return
         }
-      : sessionUser
+        if (vaultRef.current || sessionRef.current.authMode === 'legacy') {
+          setSessionExpired(true)
+        } else {
+          sessionRef.current = null
+          setSession(null)
+        }
+      }),
+    []
+  )
+
+  // Decrypted profile picture.
+  useEffect(() => {
+    const reference = pictureReference(profile)
+    if (!reference || !vault) {
+      return undefined
+    }
+    let cancelled = false
+    attachments
+      .resolve(reference)
+      .then((url) => {
+        if (!cancelled) {
+          setPictureUrl(url)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setPictureUrl(null)
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [attachments, profile, vault])
+
+  // ── authentication flows ──────────────────────────────────────────────
+  const login = useCallback(
+    async (email, password) => {
+      const preloginData = await account.prelogin(api, email)
+      if (preloginData.authMode === 'legacy') {
+        adoptSessionPayload(await api.post('/api/auth/login', { email, password }))
+        return { legacy: true }
+      }
+      const { data, vault: opened } = await account.loginEncrypted({ api, email, password, preloginData })
+      await adoptVault(opened, data)
+      return { legacy: false }
+    },
+    [adoptSessionPayload, adoptVault]
+  )
+
+  const signup = useCallback(
+    async ({ email, password, firstName, lastName, inviteCode }) => {
+      const { data, vault: opened, recoveryKey } = await account.signup({
+        api,
+        email,
+        password,
+        firstName,
+        lastName,
+        inviteCode,
+      })
+      await adoptVault(opened, data)
+      await requestRecoveryAcknowledgement(recoveryKey, 'signup')
+    },
+    [adoptVault, requestRecoveryAcknowledgement]
+  )
+
+  const unlock = useCallback(
+    async (password) => {
+      const current = sessionRef.current
+      const opened = await account.unlockWithPassword({ api, bootstrap: current.bootstrap, password })
+      await adoptVault(opened, {
+        user: current.user,
+        vaultBootstrap: current.bootstrap,
+        encryptedProfile: current.encryptedProfile,
+        profileBlobId: current.profileBlobId,
+      })
+      for (const handler of resumeHandlers.current) {
+        handler()
+      }
+    },
+    [adoptVault]
+  )
+
+  // DATA-2: sign in again after the session expired, keeping the open vault.
+  const reauthenticate = useCallback(
+    async (password) => {
+      const current = sessionRef.current
+      const payload = await account.reauthenticate({ api, email: current.user.email, password })
+      const rotatedElsewhere =
+        vaultRef.current &&
+        payload.vaultBootstrap?.vaultKeyId &&
+        payload.vaultBootstrap.vaultKeyId !== vaultRef.current.currentKeyId
+      if (rotatedElsewhere) {
+        // The key was rotated on another device: unlock again with it.
+        clearVault()
+        adoptSessionPayload(payload)
+        return { relock: true }
+      }
+      setSession((previous) => ({ ...previous, bootstrap: payload.vaultBootstrap || previous.bootstrap }))
+      setSessionExpired(false)
+      for (const handler of resumeHandlers.current) {
+        handler()
+      }
+      return { relock: false }
+    },
+    [adoptSessionPayload, clearVault]
+  )
+
+  const lock = useCallback(
+    async (reason = 'manual') => {
+      if (!vaultRef.current) {
+        return true
+      }
+      if (!(await runLockHandlers())) {
+        return false
+      }
+      clearVault()
+      setLockNotice(reason === 'idle' ? 'Locked after inactivity.' : null)
+      return true
+    },
+    [clearVault, runLockHandlers]
+  )
+
+  const logout = useCallback(async () => {
+    const current = sessionRef.current
+    await runLockHandlers()
+    try {
+      await api.post('/api/auth/logout')
+    } catch {
+      // the local logout still happens
+    }
+    // SEC-11: no notes metadata or ciphertext is left behind on a shared
+    // device, except unsent edits, which are never discarded silently.
+    if (current?.user?.id && !getDeviceSettings().keepCacheOnLogout) {
+      await clearUserData(current.user.id)
+    }
+    clearVault()
+    sessionRef.current = null
+    setSession(null)
+    setSessionExpired(false)
+  }, [clearVault, runLockHandlers])
+
+  const unsentEditCount = useCallback(async () => {
+    const current = sessionRef.current
+    return current?.user?.id ? countOutboxEntries(current.user.id) : 0
+  }, [])
+
+  const recover = useCallback(
+    async ({ email, recoveryKey, newPassword }) => {
+      const prepared = await account.prepareRecovery({ api, email, recoveryKey, newPassword })
+      try {
+        await requestRecoveryAcknowledgement(prepared.recoveryKey, 'recovery', { cancellable: true })
+      } catch (error) {
+        prepared.cancel()
+        throw error
+      }
+      const { data, vault: opened } = await prepared.commit()
+      await adoptVault(opened, data)
+    },
+    [adoptVault, requestRecoveryAcknowledgement]
+  )
+
+  const changePassword = useCallback(async (currentPassword, newPassword) => {
+    const current = sessionRef.current
+    const payload = await account.changePassword({ api, bootstrap: current.bootstrap, currentPassword, newPassword })
+    setSession((previous) => ({ ...previous, bootstrap: payload.vaultBootstrap }))
+  }, [])
+
+  const regenerateRecoveryKey = useCallback(
+    async (password) => {
+      const current = sessionRef.current
+      const prepared = await account.prepareNewRecoveryKey({ api, bootstrap: current.bootstrap, password })
+      await requestRecoveryAcknowledgement(prepared.recoveryKey, 'regenerate', { cancellable: true })
+      const result = await prepared.commit()
+      setSession((previous) => ({
+        ...previous,
+        bootstrap: { ...previous.bootstrap, recoveryKeyUpdatedAt: result.recoveryKeyUpdatedAt },
+      }))
+    },
+    [requestRecoveryAcknowledgement]
+  )
+
+  const deleteAccount = useCallback(
+    async (password) => {
+      const current = sessionRef.current
+      await account.deleteAccount({ api, bootstrap: current.bootstrap, password })
+      await clearUserData(current.user.id, { includeOutbox: true })
+      clearVault()
+      sessionRef.current = null
+      setSession(null)
+    },
+    [clearVault]
+  )
+
+  const saveProfile = useCallback(
+    async ({ firstName, lastName, file }) => {
+      const currentVault = vaultRef.current
+      if (!currentVault) {
+        throw new Error('Unlock the vault first')
+      }
+      let next = { ...(profile || EMPTY_PROFILE), first_name: firstName, last_name: lastName }
+      if (file) {
+        const uploaded = await uploadFile({ api, vault: currentVault, file })
+        next = {
+          ...next,
+          profile_picture_blob_id: uploaded.blobId,
+          profile_picture_blob_uuid: uploaded.blobUuid,
+          profile_picture_blob_version: uploaded.blobVersion,
+          profile_picture_key_id: uploaded.keyId,
+          profile_picture_mime_type: uploaded.mimeType,
+        }
+        attachments.remember(uploaded.blobId, new Uint8Array(await file.arrayBuffer()), uploaded.mimeType)
+      }
+      const encryptedProfile = await account.encryptProfile(currentVault, next)
+      const profileBlobId = next.profile_picture_blob_id ? Number(next.profile_picture_blob_id) : null
+      await api.put('/api/users/profile', { encryptedProfile, profileBlobId })
+      setProfile(next)
+      setSession((previous) => ({ ...previous, encryptedProfile, profileBlobId }))
+    },
+    [attachments, profile]
+  )
+
+  // ── legacy upgrade, rotation, format upgrade ──────────────────────────
+  const upgradeLegacyAccount = useCallback(
+    async (newPassword, onProgress) => {
+      const result = await migrateLegacyAccount({
+        api,
+        newPassword,
+        onProgress,
+        acknowledgeRecoveryKey: (key) => requestRecoveryAcknowledgement(key, 'migration', { cancellable: true }),
+      })
+      await adoptVault(result.vault, result.data)
+      return result.summary
+    },
+    [adoptVault, requestRecoveryAcknowledgement]
+  )
+
+  const upgradeEncryption = useCallback(async (onProgress) => {
+    const result = await reencryptVault({ api, vault: vaultRef.current, onProgress })
+    if (result.complete) {
+      vaultRef.current.minEnvelopeVersion = 3
+      setSession((previous) => ({ ...previous, bootstrap: result.data.vaultBootstrap }))
+    }
+    return result
+  }, [])
+
+  const rotateKey = useCallback(
+    async ({ currentPassword, newPassword }, onProgress) => {
+      const current = sessionRef.current
+      const prepared = await prepareKeyRotation({ api, bootstrap: current.bootstrap, currentPassword, newPassword })
+      try {
+        await requestRecoveryAcknowledgement(prepared.recoveryKey, 'rotation', { cancellable: true })
+      } catch (error) {
+        prepared.cancel()
+        throw error
+      }
+      await runLockHandlers()
+      const { data, vault: rotated } = await prepared.commit()
+      await adoptVault(rotated, data)
+      const result = await reencryptVault({ api, vault: rotated, onProgress })
+      if (result.complete) {
+        rotated.minEnvelopeVersion = 3
+        setSession((previous) => ({ ...previous, bootstrap: result.data.vaultBootstrap }))
+      }
+      return result
+    },
+    [adoptVault, requestRecoveryAcknowledgement, runLockHandlers]
+  )
+
+  const updateDeviceSettings = useCallback((patch) => {
+    setDeviceSettingsState(setDeviceSettings(patch))
+  }, [])
+
+  // ── idle auto-lock (SEC-11) ───────────────────────────────────────────
+  useEffect(() => {
+    const minutes = deviceSettings.autoLockMinutes
+    if (!vault || !minutes) {
+      return undefined
+    }
+    let lastActivity = Date.now()
+    const touch = () => {
+      lastActivity = Date.now()
+    }
+    const events = ['pointerdown', 'keydown', 'wheel', 'touchstart']
+    for (const name of events) {
+      window.addEventListener(name, touch, { passive: true })
+    }
+    const timer = window.setInterval(() => {
+      if (Date.now() - lastActivity >= minutes * 60 * 1000) {
+        void lock('idle')
+      }
+    }, 30 * 1000)
+    return () => {
+      for (const name of events) {
+        window.removeEventListener(name, touch)
+      }
+      window.clearInterval(timer)
+    }
+  }, [deviceSettings.autoLockMinutes, lock, vault])
+
+  const authMode = session?.authMode || null
+  const vaultLocked = authMode === 'e2ee' && !vault
+  const user = session
+    ? authMode === 'e2ee'
+      ? { ...session.user, ...(profile || {}), profile_picture: pictureUrl }
+      : { ...session.user, profile_picture: null }
     : null
 
-  return (
-    <AuthContext.Provider
-      value={{
-        user,
-        loading,
-        authMode,
-        vaultLocked,
-        pendingRecoveryKey,
-        login,
-        signup,
-        logout,
-        unlockVault,
-        recoverAccount,
-        rekeyVault,
-        saveProfile,
-        updateUser,
-        dismissRecoveryKey,
-        encryptNoteContent,
-        decryptNoteContent,
-        encryptNoteSummary,
-        decryptNoteSummary,
-        encryptNoteSearchText,
-        decryptNoteSearchText,
-        uploadEncryptedBlob,
-        deleteBlob,
-        resolveEncryptedBlobUrl,
-        revokeBlobUrl,
-        extractBlobIdsFromContent,
-      }}
-    >
-      {children}
-    </AuthContext.Provider>
-  )
+  const value = {
+    loading,
+    user,
+    session,
+    authMode,
+    vault,
+    vaultLocked,
+    profile,
+    sessionExpired,
+    lockNotice,
+    recoveryPrompt,
+    upgradeDeferred,
+    setUpgradeDeferred,
+    attachments,
+    deviceSettings,
+    api,
+    login,
+    signup,
+    unlock,
+    lock,
+    logout,
+    reauthenticate,
+    recover,
+    changePassword,
+    regenerateRecoveryKey,
+    deleteAccount,
+    saveProfile,
+    upgradeLegacyAccount,
+    upgradeEncryption,
+    rotateKey,
+    unsentEditCount,
+    updateDeviceSettings,
+    registerLockHandler,
+    registerResumeHandler,
+  }
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
 export function useAuth() {

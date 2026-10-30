@@ -2,9 +2,10 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import toast from 'react-hot-toast'
 import { useAuth } from '../context/AuthContext.jsx'
+import { MIN_PASSWORD_LENGTH, normalizeRecoveryKey } from '../lib/envelope.js'
 
 export default function Login() {
-  const { login, recoverAccount } = useAuth()
+  const { login, recover } = useAuth()
   const [mode, setMode] = useState('login')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -15,12 +16,9 @@ export default function Login() {
   async function handleLoginSubmit(e) {
     e.preventDefault()
     setSubmitting(true)
-
     try {
-      const result = await login(email, password)
-      if (result?.migrated) {
-        toast.success('Account upgraded to encrypted storage')
-      } else {
+      const result = await login(email.trim(), password)
+      if (!result?.legacy) {
         toast.success('Welcome back!')
       }
     } catch (error) {
@@ -32,13 +30,19 @@ export default function Login() {
 
   async function handleRecoverySubmit(e) {
     e.preventDefault()
-    setSubmitting(true)
-
+    let key
     try {
-      await recoverAccount(email, recoveryKey, newPassword)
-      toast.success('Password reset. Save the new recovery key before closing it.')
-      setMode('login')
-      setPassword('')
+      // CRYPTO-4: spaces, line breaks and invisible characters from copying
+      // or the grouped display are ignored.
+      key = normalizeRecoveryKey(recoveryKey)
+    } catch (error) {
+      toast.error(error.message)
+      return
+    }
+    setSubmitting(true)
+    try {
+      await recover({ email: email.trim(), recoveryKey: key, newPassword })
+      toast.success('Password reset. Other devices were signed out.')
       setRecoveryKey('')
       setNewPassword('')
     } catch (error) {
@@ -56,9 +60,11 @@ export default function Login() {
         {mode === 'login' ? (
           <form onSubmit={handleLoginSubmit}>
             <div className="form-group">
-              <label>Email</label>
+              <label htmlFor="login-email">Email</label>
               <input
+                id="login-email"
                 type="email"
+                autoComplete="username"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
@@ -66,9 +72,11 @@ export default function Login() {
               />
             </div>
             <div className="form-group">
-              <label>Password</label>
+              <label htmlFor="login-password">Password</label>
               <input
+                id="login-password"
                 type="password"
+                autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
@@ -81,9 +89,11 @@ export default function Login() {
         ) : (
           <form onSubmit={handleRecoverySubmit}>
             <div className="form-group">
-              <label>Email</label>
+              <label htmlFor="recover-email">Email</label>
               <input
+                id="recover-email"
                 type="email"
+                autoComplete="username"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
@@ -91,23 +101,30 @@ export default function Login() {
               />
             </div>
             <div className="form-group">
-              <label>Recovery Key</label>
+              <label htmlFor="recover-key">Recovery Key</label>
               <input
+                id="recover-key"
                 type="text"
+                autoComplete="off"
+                spellCheck={false}
                 value={recoveryKey}
                 onChange={(e) => setRecoveryKey(e.target.value)}
                 required
               />
             </div>
             <div className="form-group">
-              <label>New Password</label>
+              <label htmlFor="recover-password">New Password</label>
               <input
+                id="recover-password"
                 type="password"
+                autoComplete="new-password"
+                minLength={MIN_PASSWORD_LENGTH}
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
                 required
               />
             </div>
+            <p className="form-hint">You will get a new recovery key; the one you enter here stops working.</p>
             <button type="submit" className="btn-primary" disabled={submitting}>
               {submitting ? 'Recovering...' : 'Recover Encrypted Account'}
             </button>

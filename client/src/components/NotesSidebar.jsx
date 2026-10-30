@@ -1,12 +1,33 @@
 import { useEffect, useRef } from 'react'
-import { ArrowLeft, Plus, RotateCcw, Search, Trash2, X } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, Plus, RotateCcw, Search, ShieldAlert, Trash2, X } from 'lucide-react'
 
+// DATA-8: an undecryptable note is listed as such instead of hiding the list.
 function getNoteTitle(note) {
+  if (note.decryptError && !note.summary?.title) {
+    return "Can't decrypt this note"
+  }
   return note.summary?.title || 'Untitled'
 }
 
 function getNotePreview(note) {
+  if (note.decryptError) {
+    return `Error: ${note.decryptError.code}`
+  }
   return note.summary?.preview || ''
+}
+
+function NoteBadges({ note, saveState }) {
+  const unsent = saveState && ['pending', 'saving', 'retrying', 'offline', 'auth'].includes(saveState.state)
+  const needsDecision = note.has_conflict || saveState?.state === 'conflict' || saveState?.state === 'failed'
+  return (
+    <>
+      {note.decryptError && <ShieldAlert size={13} className="note-badge note-badge-error" aria-label="Cannot decrypt" />}
+      {needsDecision && (
+        <AlertTriangle size={13} className="note-badge note-badge-warn" aria-label="Has conflicting edits" />
+      )}
+      {unsent && <span className="note-badge-dot" title="Not yet saved to the server" />}
+    </>
+  )
 }
 
 function formatDate(dateStr) {
@@ -45,6 +66,7 @@ export default function NotesSidebar({
   onSelectTrashNote,
   activeTrashNoteId,
   searchStatus,
+  saveStates = {},
 }) {
   const listRef = useRef(null)
   const selectedNoteId = trashView ? activeTrashNoteId : activeNoteId
@@ -153,7 +175,10 @@ export default function NotesSidebar({
             onClick={() => onSelectNote(note.id)}
           >
             <div className="note-item-header">
-              <div className="note-item-title">{getNoteTitle(note)}</div>
+              <div className="note-item-title">
+                {getNoteTitle(note)}
+                <NoteBadges note={note} saveState={saveStates[note.id]} />
+              </div>
               <button
                 className="btn-ghost"
                 style={{ padding: 4, flexShrink: 0 }}

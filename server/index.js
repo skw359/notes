@@ -1,74 +1,52 @@
-import express from 'express';
-import cors from 'cors';
-import cookieParser from 'cookie-parser';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-
-import authRoutes from './routes/auth.js';
-import blobsRoutes from './routes/blobs.js';
-import notesRoutes from './routes/notes.js';
-import uploadsRoutes from './routes/uploads.js';
-import usersRoutes from './routes/users.js';
-import { ensureSchema } from './schema.js';
+import { createApp, createContext } from './app.js';
+import { loadConfig } from './config.js';
+import { createPool } from './db.js';
+import { backfillLegacyUploads } from './lib/legacyUploads.js';
+import { runMigrations } from './migrations/runner.js';
+import { startMaintenanceSchedule } from './services/maintenance.js';
 
 dotenv.config();
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const app = express();
-const PORT = process.env.PORT || 3004;
-
-app.use(cors({ origin: 'http://localhost:5173', credentials: true }));
-
-// The vault key lives in browser memory, so script injection is key
-// exfiltration; the CSP restricts execution to our own bundle
-// ('wasm-unsafe-eval' is required by the bundled argon2 WASM, blob:/data:
-// images by decrypted attachments, and the font hosts by index.html).
-app.use((req, res, next) => {
-  res.setHeader(
-    'Content-Security-Policy',
-    [
-      "default-src 'self'",
-      "script-src 'self' 'wasm-unsafe-eval'",
-      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-      "font-src 'self' data: https://fonts.gstatic.com",
-      "img-src 'self' blob: data:",
-      "connect-src 'self'",
-      "media-src 'self' blob:",
-      "object-src 'none'",
-      "base-uri 'self'",
-      "form-action 'self'",
-      "frame-ancestors 'none'",
-    ].join('; ')
-  );
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  next();
-});
-
-app.use(express.json({ limit: '50mb' }));
-app.use(cookieParser());
-
-app.use('/api/auth', authRoutes);
-app.use('/api/blobs', blobsRoutes);
-app.use('/api/legacy-uploads', uploadsRoutes);
-app.use('/api/notes', notesRoutes);
-app.use('/api/users', usersRoutes);
-
-// Serve built frontend
-const clientDist = path.join(__dirname, '..', 'client', 'dist');
-app.use(express.static(clientDist));
-app.get('*', (req, res) => {
-  res.sendFile(path.join(clientDist, 'index.html'));
-});
-
 async function start() {
-  await ensureSchema();
+  const config = loadConfig();
+  const pool = createPool(config.db);
 
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-  });
+  const applied = await runMigrations(pool);
+  if (applied.length) {
+    console.log(`Applied database migrations: ${applied.join(', ')}`);
+  }
+
+  const ctx = await createContext({ config, pool });
+  await backfillLegacyUploads({ pool, legacyUploadsDir: config.storage.legacyUploadsDir });
+
+  if (config.cookie.secure === 'false') {
+    console.warn('COOKIE_SECURE=false: session cookies are sent over plain HTTP. Use this for local development only.');
+  }
+
+  const app = createApp(ctx);
+  const server = config.host
+    ? app.listen(config.port, config.host, () => console.log(`Server running on ${config.host}:${config.port}`))
+    : app.listen(config.port, () => console.log(`Server running on port ${config.port}`));
+
+  const maintenance = config.jobs.enabled ? startMaintenanceSchedule(ctx) : null;
+
+  let shuttingDown = false;
+  async function shutdown(signal) {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    console.log(`${signal} received, shutting down`);
+    maintenance?.stop();
+    server.close(async () => {
+      await pool.end().catch(() => {});
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 10000).unref();
+  }
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 start().catch((error) => {

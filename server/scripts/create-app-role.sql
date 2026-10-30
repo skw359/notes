@@ -1,0 +1,33 @@
+-- OPS-1: run the app as a least-privilege role instead of the postgres
+-- superuser. Run once as a superuser, e.g.:
+--   psql -U postgres -v app_password="'choose-a-strong-password'" -f server/scripts/create-app-role.sql
+-- then set DB_USER=notes_app and DB_PASSWORD in server/.env.
+--
+-- The role owns only its own database, so migrations (run by the server on
+-- start) can create and alter tables there and nowhere else. It cannot
+-- create roles or databases, read other databases' data, or run superuser
+-- functions such as COPY ... TO PROGRAM.
+
+CREATE ROLE notes_app LOGIN PASSWORD :app_password NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+
+-- New installs: create the database owned by the role.
+--   CREATE DATABASE notes_app OWNER notes_app;
+--
+-- Existing installs (tables created by postgres): hand them over.
+--   \c notes_app
+--   ALTER DATABASE notes_app OWNER TO notes_app;
+--   ALTER SCHEMA public OWNER TO notes_app;
+--   DO $$
+--   DECLARE r record;
+--   BEGIN
+--     FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+--       EXECUTE format('ALTER TABLE public.%I OWNER TO notes_app', r.tablename);
+--     END LOOP;
+--     FOR r IN SELECT sequencename FROM pg_sequences WHERE schemaname = 'public' LOOP
+--       EXECUTE format('ALTER SEQUENCE public.%I OWNER TO notes_app', r.sequencename);
+--     END LOOP;
+--     FOR r IN SELECT p.oid::regprocedure AS fn FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+--              WHERE n.nspname = 'public' LOOP
+--       EXECUTE format('ALTER FUNCTION %s OWNER TO notes_app', r.fn);
+--     END LOOP;
+--   END $$;

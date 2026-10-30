@@ -1,31 +1,49 @@
-import jwt from 'jsonwebtoken';
-import dotenv from 'dotenv';
+import { unauthorized } from '../lib/errors.js';
+import { clearSessionCookie, setSessionCookie } from '../lib/sessions.js';
 
-// Load env here as well: this module can be evaluated before index.js runs
-// dotenv.config(), and a missing secret must never fall back to a constant.
-dotenv.config();
-
-const JWT_SECRET = process.env.JWT_SECRET;
-
-if (!JWT_SECRET) {
-  throw new Error(
-    'JWT_SECRET is not set. Add it to server/.env, e.g.: JWT_SECRET=<output of `openssl rand -hex 32`>'
-  );
+function attachSession(req, resolved) {
+  const { session } = resolved;
+  req.user = { id: session.user_id, email: session.email, authMode: session.auth_mode };
+  req.session = { id: session.id, createdAt: session.created_at, expiresAt: session.expires_at };
 }
 
-export function authenticateToken(req, res, next) {
-  const token = req.cookies?.token;
-  if (!token) {
-    return res.status(401).json({ error: 'Authentication required' });
+// Resolves the session cookie once per request and puts the user, including
+// their auth mode, on the request (no extra auth_mode query per handler).
+export function createSessionMiddleware({ sessions, config }) {
+  async function resolveFromCookie(req, res) {
+    const token = req.cookies?.[config.cookie.name];
+    if (!token) {
+      return { status: 'missing' };
+    }
+
+    const resolved = await sessions.resolve(token, req);
+    if (!resolved) {
+      clearSessionCookie(res, req, config);
+      return { status: 'invalid' };
+    }
+
+    if (resolved.token !== token || resolved.renewed) {
+      setSessionCookie(res, req, config, resolved.token, resolved.session.expires_at);
+    }
+    attachSession(req, resolved);
+    return { status: 'ok' };
   }
 
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
+  async function requireSession(req, res, next) {
+    const { status } = await resolveFromCookie(req, res);
+    if (status === 'missing') {
+      throw unauthorized('Authentication required', 'AUTH_REQUIRED');
+    }
+    if (status === 'invalid') {
+      throw unauthorized('Your session has expired. Sign in again to continue.', 'SESSION_EXPIRED');
+    }
     next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
   }
-}
 
-export { JWT_SECRET };
+  async function optionalSession(req, res, next) {
+    await resolveFromCookie(req, res);
+    next();
+  }
+
+  return { requireSession, optionalSession };
+}

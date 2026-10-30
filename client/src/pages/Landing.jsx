@@ -392,7 +392,10 @@ export default function Landing() {
                 <Lock size={18} />
               </div>
               <h3>End-to-end encrypted</h3>
-              <p>Your notes are encrypted on your device before they ever leave. Only you can read them.</p>
+              <p>
+                Notes, attachments and your profile are encrypted in your browser with a key derived from your password.
+                The server keeps only their ciphertext, plus metadata such as your email address, sizes and times.
+              </p>
             </div>
           </div>
         </section>

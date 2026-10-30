@@ -4,6 +4,10 @@ import { BrowserRouter } from 'react-router-dom'
 import { AuthProvider } from './context/AuthContext.jsx'
 import { ThemeProvider } from './context/ThemeContext.jsx'
 import App from './App.jsx'
+// Self-hosted (SEC-11): no third-party font requests on every visit.
+import '@fontsource/montserrat/400.css'
+import '@fontsource/montserrat/600.css'
+import '@fontsource/montserrat/700.css'
 import './App.css'
 
 createRoot(document.getElementById('root')).render(

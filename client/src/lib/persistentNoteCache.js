@@ -1,160 +1,225 @@
+// Device-local storage. Holds ciphertext and metadata only, never plaintext:
+//   summary_lists  last summary list per user (encrypted summaries)
+//   note_bodies    encrypted note bodies, keyed by revision
+//   note_search    search text, encrypted under the vault key
+//   outbox         saves not yet confirmed by the server (encrypted), so an
+//                  edit survives reloads, crashes and offline periods
+//   meta           sync position, revision high-water marks, settings
+// Every operation degrades to a no-op if IndexedDB is unavailable.
 const DB_NAME = 'notes-persistent-cache'
-const DB_VERSION = 1
+const DB_VERSION = 2
 const SUMMARY_STORE = 'summary_lists'
 const BODY_STORE = 'note_bodies'
 const SEARCH_STORE = 'note_search'
+const OUTBOX_STORE = 'outbox'
+const META_STORE = 'meta'
+const ALL_STORES = [SUMMARY_STORE, BODY_STORE, SEARCH_STORE, OUTBOX_STORE, META_STORE]
 
 let dbPromise = null
 
-function supportsIndexedDb() {
-  return typeof indexedDB !== 'undefined'
-}
-
 function openDb() {
-  if (!supportsIndexedDb()) {
+  if (typeof indexedDB === 'undefined') {
     return Promise.resolve(null)
   }
-
   if (!dbPromise) {
     dbPromise = new Promise((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION)
-
       request.onupgradeneeded = () => {
         const db = request.result
-
-        if (!db.objectStoreNames.contains(SUMMARY_STORE)) {
-          db.createObjectStore(SUMMARY_STORE, { keyPath: 'id' })
-        }
-
-        if (!db.objectStoreNames.contains(BODY_STORE)) {
-          db.createObjectStore(BODY_STORE, { keyPath: 'id' })
-        }
-
-        if (!db.objectStoreNames.contains(SEARCH_STORE)) {
-          db.createObjectStore(SEARCH_STORE, { keyPath: 'id' })
+        for (const name of ALL_STORES) {
+          if (!db.objectStoreNames.contains(name)) {
+            db.createObjectStore(name, { keyPath: 'id' })
+          }
         }
       }
-
-      request.onsuccess = () => resolve(request.result)
+      request.onsuccess = () => {
+        const db = request.result
+        // Another tab upgrading the schema must not be blocked by this one.
+        db.onversionchange = () => {
+          db.close()
+          dbPromise = null
+        }
+        resolve(db)
+      }
       request.onerror = () => reject(request.error || new Error('Failed to open local cache'))
-    }).catch((error) => {
+    }).catch(() => {
       dbPromise = null
-      throw error
+      return null
     })
   }
-
   return dbPromise
 }
 
-function summaryKey(userId, scope) {
-  return `${userId}:${scope}`
+function requestToPromise(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
 }
 
-function noteKey(userId, noteId) {
-  return `${userId}:${noteId}`
-}
-
-async function getRecord(storeName, key) {
+async function withStore(storeName, mode, fn) {
   const db = await openDb()
   if (!db) {
     return null
   }
-
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(storeName, 'readonly')
+    let result
+    const tx = db.transaction(storeName, mode)
     const store = tx.objectStore(storeName)
-    const request = store.get(key)
-
-    request.onsuccess = () => resolve(request.result || null)
-    request.onerror = () => reject(request.error || new Error('Failed to read local cache'))
+    Promise.resolve(fn(store))
+      .then((value) => {
+        result = value
+      })
+      .catch(reject)
+    tx.oncomplete = () => resolve(result)
+    tx.onerror = () => reject(tx.error || new Error('Local storage failed'))
+    tx.onabort = () => reject(tx.error || new Error('Local storage aborted'))
   })
+}
+
+async function getRecord(storeName, key) {
+  try {
+    return (await withStore(storeName, 'readonly', (store) => requestToPromise(store.get(key)))) || null
+  } catch {
+    return null
+  }
 }
 
 async function putRecord(storeName, value) {
-  const db = await openDb()
-  if (!db) {
-    return
+  try {
+    await withStore(storeName, 'readwrite', (store) => requestToPromise(store.put(value)))
+    return true
+  } catch {
+    return false
   }
-
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(storeName, 'readwrite')
-    const store = tx.objectStore(storeName)
-    store.put(value)
-
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error || new Error('Failed to write local cache'))
-    tx.onabort = () => reject(tx.error || new Error('Local cache write aborted'))
-  })
 }
 
 async function deleteRecord(storeName, key) {
-  const db = await openDb()
-  if (!db) {
-    return
+  try {
+    await withStore(storeName, 'readwrite', (store) => requestToPromise(store.delete(key)))
+  } catch {
+    // best effort
   }
-
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(storeName, 'readwrite')
-    const store = tx.objectStore(storeName)
-    store.delete(key)
-
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error || new Error('Failed to delete local cache entry'))
-    tx.onabort = () => reject(tx.error || new Error('Local cache delete aborted'))
-  })
 }
 
+async function getAllForUser(storeName, userId) {
+  try {
+    const all = (await withStore(storeName, 'readonly', (store) => requestToPromise(store.getAll()))) || []
+    return all.filter((record) => record.userId === String(userId))
+  } catch {
+    return []
+  }
+}
+
+const userKey = (userId, suffix) => `${userId}:${suffix}`
+
+// ── Summary lists ──────────────────────────────────────────────────────
 export async function getCachedSummaryList(userId, scope) {
-  const record = await getRecord(SUMMARY_STORE, summaryKey(userId, scope))
-  return record?.notes || null
+  return (await getRecord(SUMMARY_STORE, userKey(userId, scope)))?.notes || null
 }
 
-export async function setCachedSummaryList(userId, scope, notes) {
-  await putRecord(SUMMARY_STORE, {
-    id: summaryKey(userId, scope),
+export async function setCachedSummaryList(userId, scope, notes, seq = null) {
+  return putRecord(SUMMARY_STORE, {
+    id: userKey(userId, scope),
     userId: String(userId),
     scope,
     notes,
+    seq,
     cachedAt: Date.now(),
   })
 }
 
+export async function getCachedSummaryRecord(userId, scope) {
+  return getRecord(SUMMARY_STORE, userKey(userId, scope))
+}
+
+// ── Encrypted note bodies ──────────────────────────────────────────────
 export async function getCachedNote(userId, noteId) {
-  const record = await getRecord(BODY_STORE, noteKey(userId, noteId))
-  return record?.note || null
+  return (await getRecord(BODY_STORE, userKey(userId, noteId)))?.note || null
 }
 
 export async function setCachedNote(userId, note) {
-  await putRecord(BODY_STORE, {
-    id: noteKey(userId, note.id),
+  return putRecord(BODY_STORE, {
+    id: userKey(userId, note.id),
     userId: String(userId),
     noteId: String(note.id),
     note,
-    updatedAt: note.updated_at || null,
+    revision: note.revision ?? null,
     cachedAt: Date.now(),
   })
 }
 
 export async function deleteCachedNote(userId, noteId) {
-  await deleteRecord(BODY_STORE, noteKey(userId, noteId))
+  await deleteRecord(BODY_STORE, userKey(userId, noteId))
 }
 
+// ── Encrypted search text ──────────────────────────────────────────────
 export async function getCachedSearchEntry(userId, noteId) {
-  const record = await getRecord(SEARCH_STORE, noteKey(userId, noteId))
-  return record || null
+  return getRecord(SEARCH_STORE, userKey(userId, noteId))
 }
 
-export async function setCachedSearchEntry(userId, noteId, encryptedSearchText, updatedAt) {
-  await putRecord(SEARCH_STORE, {
-    id: noteKey(userId, noteId),
+export async function setCachedSearchEntry(userId, noteId, encryptedSearchText, revision) {
+  return putRecord(SEARCH_STORE, {
+    id: userKey(userId, noteId),
     userId: String(userId),
     noteId: String(noteId),
     encryptedSearchText,
-    updatedAt: updatedAt || null,
+    revision: revision ?? null,
     cachedAt: Date.now(),
   })
 }
 
 export async function deleteCachedSearchEntry(userId, noteId) {
-  await deleteRecord(SEARCH_STORE, noteKey(userId, noteId))
+  await deleteRecord(SEARCH_STORE, userKey(userId, noteId))
+}
+
+// ── Outbox (pending encrypted saves) ───────────────────────────────────
+export async function getOutboxEntries(userId) {
+  return getAllForUser(OUTBOX_STORE, userId)
+}
+
+export async function putOutboxEntry(userId, entry) {
+  return putRecord(OUTBOX_STORE, { ...entry, id: userKey(userId, entry.noteId), userId: String(userId) })
+}
+
+export async function deleteOutboxEntry(userId, noteId) {
+  await deleteRecord(OUTBOX_STORE, userKey(userId, noteId))
+}
+
+// ── Meta (sync position, high-water marks, device settings) ─────────────
+export async function getMeta(userId, key) {
+  return (await getRecord(META_STORE, userKey(userId, key)))?.value ?? null
+}
+
+export async function setMeta(userId, key, value) {
+  return putRecord(META_STORE, { id: userKey(userId, key), userId: String(userId), key, value })
+}
+
+// CRYPTO-5: the highest revision of each note this device has seen. A server
+// answering with a lower one is rolling the note back.
+export async function getRevisionHighWater(userId) {
+  return (await getMeta(userId, 'revision-high-water')) || {}
+}
+
+export async function setRevisionHighWater(userId, marks) {
+  return setMeta(userId, 'revision-high-water', marks)
+}
+
+/**
+ * Removes this user's data from the device (logout, account deletion,
+ * SEC-11). Unsent encrypted drafts are kept unless `includeOutbox` is set,
+ * so logging out can never destroy an edit that has not reached the server.
+ */
+export async function clearUserData(userId, { includeOutbox = false } = {}) {
+  const stores = includeOutbox ? ALL_STORES : ALL_STORES.filter((name) => name !== OUTBOX_STORE)
+  for (const storeName of stores) {
+    const records = await getAllForUser(storeName, userId)
+    for (const record of records) {
+      await deleteRecord(storeName, record.id)
+    }
+  }
+}
+
+export async function countOutboxEntries(userId) {
+  return (await getOutboxEntries(userId)).length
 }
