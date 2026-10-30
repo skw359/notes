@@ -14,6 +14,11 @@ const SEARCH_STORE = 'note_search'
 const OUTBOX_STORE = 'outbox'
 const META_STORE = 'meta'
 const ALL_STORES = [SUMMARY_STORE, BODY_STORE, SEARCH_STORE, OUTBOX_STORE, META_STORE]
+// The cache is an optimization: an operation that does not finish in time
+// (a tab of an older app version blocking the schema upgrade, a lost
+// connection in Safari) is treated as a cache miss instead of stalling the app.
+const BLOCKED_GRACE_MS = 3000
+const OPERATION_TIMEOUT_MS = 5000
 
 let dbPromise = null
 
@@ -23,6 +28,13 @@ function openDb() {
   }
   if (!dbPromise) {
     dbPromise = new Promise((resolve, reject) => {
+      let settled = false
+      const finish = (db) => {
+        if (!settled) {
+          settled = true
+          resolve(db)
+        }
+      }
       const request = indexedDB.open(DB_NAME, DB_VERSION)
       request.onupgradeneeded = () => {
         const db = request.result
@@ -39,9 +51,23 @@ function openDb() {
           db.close()
           dbPromise = null
         }
-        resolve(db)
+        if (settled) {
+          // Opened after this page gave up waiting: use it from now on.
+          dbPromise = Promise.resolve(db)
+          return
+        }
+        finish(db)
       }
-      request.onerror = () => reject(request.error || new Error('Failed to open local cache'))
+      request.onerror = () => {
+        if (!settled) {
+          reject(request.error || new Error('Failed to open local cache'))
+        }
+      }
+      // An open tab of an older app version holds the database at its old
+      // version; work without the cache until that tab is closed.
+      request.onblocked = () => {
+        setTimeout(() => finish(null), BLOCKED_GRACE_MS)
+      }
     }).catch(() => {
       dbPromise = null
       return null
@@ -64,16 +90,21 @@ async function withStore(storeName, mode, fn) {
   }
   return new Promise((resolve, reject) => {
     let result
+    const timer = setTimeout(() => reject(new Error('Local storage timed out')), OPERATION_TIMEOUT_MS)
+    const done = (callback) => (value) => {
+      clearTimeout(timer)
+      callback(value)
+    }
     const tx = db.transaction(storeName, mode)
     const store = tx.objectStore(storeName)
     Promise.resolve(fn(store))
       .then((value) => {
         result = value
       })
-      .catch(reject)
-    tx.oncomplete = () => resolve(result)
-    tx.onerror = () => reject(tx.error || new Error('Local storage failed'))
-    tx.onabort = () => reject(tx.error || new Error('Local storage aborted'))
+      .catch(done(reject))
+    tx.oncomplete = () => done(resolve)(result)
+    tx.onerror = () => done(reject)(tx.error || new Error('Local storage failed'))
+    tx.onabort = () => done(reject)(tx.error || new Error('Local storage aborted'))
   })
 }
 

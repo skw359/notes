@@ -159,12 +159,14 @@ describe('CRYPTO-1 / CRYPTO-5: key rotation and format upgrade', () => {
     )
     const noteIds = []
     await server.pool.query('ALTER TABLE notes DISABLE TRIGGER notes_before_write')
-    for (const text of ['first v1 note', 'second v1 note']) {
+    // The last one is in the trash: re-encryption must reach it and leave it there.
+    for (const text of ['first v1 note', 'second v1 note', 'trashed v1 note']) {
       const content = v1(Buffer.from(JSON.stringify(doc(text)))).envelope
       const summary = v1(Buffer.from(JSON.stringify({ title: text, preview: '' }))).envelope
       const row = await server.pool.query(
-        `INSERT INTO notes (user_id, encrypted_content, encrypted_summary, revision, blob_refs_known) VALUES ($1, $2, $3, 1, FALSE) RETURNING id`,
-        [userId, JSON.stringify(content), JSON.stringify(summary)]
+        `INSERT INTO notes (user_id, encrypted_content, encrypted_summary, revision, blob_refs_known, deleted_at)
+         VALUES ($1, $2, $3, 1, FALSE, $4) RETURNING id`,
+        [userId, JSON.stringify(content), JSON.stringify(summary), text.startsWith('trashed') ? '2026-10-20T12:00:00Z' : null]
       )
       noteIds.push(row.rows[0].id)
     }
@@ -175,7 +177,7 @@ describe('CRYPTO-1 / CRYPTO-5: key rotation and format upgrade', () => {
     expect(session.data.vaultBootstrap.vaultKeyId).toBe(keyId)
     expect((await server.pool.query('SELECT vault_key_id FROM users WHERE id = $1', [userId])).rows[0].vault_key_id).toBe(keyId)
     const status = await session.device.api.get('/api/vault/status')
-    expect(status.pending.notes).toBe(2)
+    expect(status.pending.notes).toBe(3)
     expect(status.pending.profile).toBe(true)
 
     const result = await reencryptVault({ api: session.device.api, vault: session.vault })
@@ -188,6 +190,8 @@ describe('CRYPTO-1 / CRYPTO-5: key rotation and format upgrade', () => {
       expect(row.encrypted_content).toMatchObject({ version: 3, keyId })
       expect(row.encrypted_summary).toMatchObject({ version: 3, keyId })
     }
+    const trashed = (await server.pool.query('SELECT deleted_at FROM notes WHERE id = $1', [noteIds[2]])).rows[0]
+    expect(trashed.deleted_at.toISOString()).toBe('2026-10-20T12:00:00.000Z')
     // The profile and its picture are v3 now and still decrypt.
     const after = await login(email, PASSWORD)
     const decrypted = await decryptProfile(after.vault, after.data.encryptedProfile)
