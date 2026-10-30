@@ -1,1445 +1,433 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
-import { FileText } from 'lucide-react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { AlertTriangle, FileText, History } from 'lucide-react'
 import toast from 'react-hot-toast'
+import ConfirmDialog from '../components/ConfirmDialog.jsx'
+import ConflictBanner from '../components/ConflictBanner.jsx'
+import EditorErrorBoundary from '../components/EditorErrorBoundary.jsx'
 import Header from '../components/Header.jsx'
+import HistoryModal from '../components/HistoryModal.jsx'
+import NoteProblem from '../components/NoteProblem.jsx'
 import NotesSidebar from '../components/NotesSidebar.jsx'
+import SaveStatus from '../components/SaveStatus.jsx'
+import SessionExpiredBanner from '../components/SessionExpiredBanner.jsx'
 import VaultUnlockScreen from '../components/VaultUnlockScreen.jsx'
 import { useAuth } from '../context/AuthContext.jsx'
-import { createEmptyNoteContent } from '../lib/e2ee.js'
-import {
-  EMPTY_NOTE_SUMMARY,
-  createNoteSearchText,
-  createNoteSummary,
-  getSummarySearchText,
-} from '../lib/noteContent.js'
-import {
-  deleteCachedNote,
-  deleteCachedSearchEntry,
-  getCachedNote,
-  getCachedSearchEntry,
-  getCachedSummaryList,
-  setCachedNote,
-  setCachedSearchEntry,
-  setCachedSummaryList,
-} from '../lib/persistentNoteCache.js'
+import { uploadFile } from '../lib/attachments.js'
+import { createE2EECodec, createLegacyCodec } from '../lib/noteCodecs.js'
+import { createNoteStore } from '../lib/noteStore.js'
 
 const NoteEditor = lazy(() => import('../components/NoteEditor.jsx'))
 
-function getAdjacentNoteId(notes, activeId, direction) {
-  if (!notes.length) {
-    return null
-  }
-
-  const activeIndex = notes.findIndex((note) => note.id === activeId)
-
-  if (activeIndex === -1) {
-    return direction > 0 ? notes[0].id : notes[notes.length - 1].id
-  }
-
-  const nextIndex = Math.min(Math.max(activeIndex + direction, 0), notes.length - 1)
-  return notes[nextIndex].id
-}
+const EMPTY_SNAPSHOT = Object.freeze({
+  status: 'idle',
+  notes: [],
+  trash: [],
+  saveStates: {},
+  attention: [],
+  search: { running: false, indexed: 0, total: 0 },
+  refs: {},
+  sessionExpired: false,
+})
+const NULL_STORE = { subscribe: () => () => {}, getSnapshot: () => EMPTY_SNAPSHOT }
+const SYNC_INTERVAL_MS = 60 * 1000
+const MIN_SYNC_GAP_MS = 5 * 1000
 
 function isEditableTarget(target) {
   if (!(target instanceof HTMLElement)) {
     return false
   }
-
-  if (target.isContentEditable) {
-    return true
-  }
-
-  return Boolean(
-    target.closest(
-      'input, textarea, select, [contenteditable=""], [contenteditable="true"], [role="textbox"]'
-    )
+  return (
+    target.isContentEditable ||
+    Boolean(target.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"], [role="textbox"]'))
   )
 }
 
-function sortNotesByMostRecent(notes) {
-  return [...notes].sort((a, b) => {
-    const aUpdated = new Date(a.updated_at || 0).getTime()
-    const bUpdated = new Date(b.updated_at || 0).getTime()
-    if (bUpdated !== aUpdated) return bUpdated - aUpdated
-
-    const aCreated = new Date(a.created_at || 0).getTime()
-    const bCreated = new Date(b.created_at || 0).getTime()
-    if (bCreated !== aCreated) return bCreated - aCreated
-
-    return (b.id || 0) - (a.id || 0)
-  })
-}
-
-function sortTrashNotes(notes) {
-  return [...notes].sort((a, b) => {
-    const aDeleted = new Date(a.deleted_at || 0).getTime()
-    const bDeleted = new Date(b.deleted_at || 0).getTime()
-    if (bDeleted !== aDeleted) return bDeleted - aDeleted
-    return sortNotesByMostRecent([a, b])[0]?.id === a.id ? -1 : 1
-  })
-}
-
-function normalizeSummary(summary) {
-  return {
-    title: summary?.title || EMPTY_NOTE_SUMMARY.title,
-    preview: summary?.preview || EMPTY_NOTE_SUMMARY.preview,
+function adjacentId(list, activeId, direction) {
+  if (!list.length) {
+    return null
   }
-}
-
-function applySummaryToNote(note, summary) {
-  return {
-    ...note,
-    summary: normalizeSummary(summary),
+  const index = list.findIndex((note) => note.id === activeId)
+  if (index === -1) {
+    return direction > 0 ? list[0].id : list[list.length - 1].id
   }
-}
-
-function prioritizeNoteIds(notes, activeNoteId) {
-  const recentIds = notes.slice(0, 10).map((note) => String(note.id))
-  const seen = new Set()
-  const ordered = []
-
-  const pushId = (value) => {
-    const key = String(value)
-    if (!seen.has(key)) {
-      seen.add(key)
-      ordered.push(key)
-    }
-  }
-
-  if (activeNoteId) {
-    pushId(activeNoteId)
-  }
-
-  for (const noteId of recentIds) {
-    pushId(noteId)
-  }
-
-  for (const note of notes) {
-    pushId(note.id)
-  }
-
-  return ordered
-}
-
-function noteMatchesQuery(note, query, indexedText) {
-  if (!query) {
-    return true
-  }
-
-  if (getSummarySearchText(note.summary).includes(query)) {
-    return true
-  }
-
-  return indexedText?.includes(query) || false
+  return list[Math.min(Math.max(index + direction, 0), list.length - 1)].id
 }
 
 export default function Dashboard() {
   const {
-    user,
+    api,
     authMode,
-    encryptNoteContent,
-    decryptNoteContent,
-    encryptNoteSummary,
-    decryptNoteSummary,
-    encryptNoteSearchText,
-    decryptNoteSearchText,
-    extractBlobIdsFromContent,
-    uploadEncryptedBlob,
-    deleteBlob,
-    resolveEncryptedBlobUrl,
-    revokeBlobUrl,
+    vault,
     vaultLocked,
+    user,
+    session,
+    profile,
+    sessionExpired,
+    attachments,
+    registerLockHandler,
+    registerResumeHandler,
+    setUpgradeDeferred,
   } = useAuth()
 
-  const [notes, setNotes] = useState([])
-  const [activeNoteId, setActiveNoteId] = useState(null)
+  const [store, setStore] = useState(null)
+  const snapshot = useSyncExternalStore((store || NULL_STORE).subscribe, (store || NULL_STORE).getSnapshot)
+  const [activeId, setActiveId] = useState(null)
+  const [trashView, setTrashView] = useState(false)
+  const [activeTrashId, setActiveTrashId] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [searchQuery, setSearchQuery] = useState('')
-  const [notesLoading, setNotesLoading] = useState(true)
-  const [trashView, setTrashView] = useState(false)
-  const [trashNotes, setTrashNotes] = useState([])
-  const [trashLoading, setTrashLoading] = useState(false)
-  const [activeTrashNoteId, setActiveTrashNoteId] = useState(null)
-  const [editorShouldAutoFocus, setEditorShouldAutoFocus] = useState(false)
-  const [activeNoteContent, setActiveNoteContent] = useState(null)
-  const [activeNoteContentId, setActiveNoteContentId] = useState(null)
-  const [activeNoteLoading, setActiveNoteLoading] = useState(false)
-  const [activeTrashNoteContent, setActiveTrashNoteContent] = useState(null)
-  const [activeTrashNoteContentId, setActiveTrashNoteContentId] = useState(null)
-  const [activeTrashNoteLoading, setActiveTrashNoteLoading] = useState(false)
-  const [searchStatus, setSearchStatus] = useState({
-    indexedCount: 0,
-    totalCount: 0,
-    running: false,
-  })
+  const [loaded, setLoaded] = useState({ key: null, content: null, error: null, rollback: null, token: 0 })
+  const [reloadToken, setReloadToken] = useState(0)
+  const [autoFocus, setAutoFocus] = useState(false)
+  // The open editor holds keystrokes that were not handed to the store yet.
+  const [editorDirty, setEditorDirty] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [pendingDelete, setPendingDelete] = useState(null)
+  const [removedNotice, setRemovedNotice] = useState(null)
+  const [limits, setLimits] = useState(null)
 
-  const notesRef = useRef([])
-  const trashNotesRef = useRef([])
-  const activeNoteIdRef = useRef(null)
-  const activeTrashNoteIdRef = useRef(null)
-  const rawSummaryListsRef = useRef({ active: null, trash: null })
-  const fullNoteCacheRef = useRef(new Map())
-  const decryptedBodyCacheRef = useRef(new Map())
-  const decryptedBodyOrderRef = useRef([])
-  const noteSearchIndexRef = useRef(new Map())
-  const indexedNoteIdsRef = useRef(new Set())
-  const noteBlobRefsRef = useRef(new Map())
-  const summaryBackfillInFlightRef = useRef(new Set())
-  const backgroundSyncStateRef = useRef({
-    token: 0,
-    controllers: new Set(),
-  })
-  const trashLoadedRef = useRef(false)
-  const newNoteRef = useRef(null)
-  const deleteNoteRef = useRef(null)
-  const arrowNavigationRef = useRef(() => false)
+  const editorRef = useRef(null)
+  const lastSyncRef = useRef(0)
+  // The decrypted profile and the envelope it came from (set together).
+  const profileIv = session?.encryptedProfile?.iv ?? null
+  const profileRef = useRef({ profile, profileIv })
+  const userId = user?.id
 
   useEffect(() => {
-    notesRef.current = notes
-  }, [notes])
+    profileRef.current = { profile, profileIv }
+  }, [profile, profileIv])
 
+  // One store per unlocked vault (or per legacy session).
   useEffect(() => {
-    trashNotesRef.current = trashNotes
-  }, [trashNotes])
-
-  useEffect(() => {
-    activeNoteIdRef.current = activeNoteId
-  }, [activeNoteId])
-
-  useEffect(() => {
-    activeTrashNoteIdRef.current = activeTrashNoteId
-  }, [activeTrashNoteId])
-
-  const countIndexedNotes = useCallback((noteList) => {
-    let count = 0
-    for (const note of noteList) {
-      if (indexedNoteIdsRef.current.has(String(note.id))) {
-        count += 1
-      }
+    if (!userId || (authMode === 'e2ee' && !vault) || !authMode) {
+      return undefined
     }
-    return count
-  }, [])
-
-  const updateSearchStatus = useCallback(
-    (noteList, running) => {
-      setSearchStatus({
-        indexedCount: countIndexedNotes(noteList),
-        totalCount: noteList.length,
-        running,
-      })
-    },
-    [countIndexedNotes]
-  )
-
-  const cancelBackgroundSync = useCallback(() => {
-    backgroundSyncStateRef.current.token += 1
-
-    for (const controller of backgroundSyncStateRef.current.controllers) {
-      controller.abort()
-    }
-
-    backgroundSyncStateRef.current.controllers.clear()
-    updateSearchStatus(notesRef.current, false)
-  }, [updateSearchStatus])
-
-  const clearSessionCaches = useCallback(() => {
-    cancelBackgroundSync()
-    rawSummaryListsRef.current = { active: null, trash: null }
-    fullNoteCacheRef.current.clear()
-    decryptedBodyCacheRef.current.clear()
-    decryptedBodyOrderRef.current = []
-    noteSearchIndexRef.current.clear()
-    indexedNoteIdsRef.current.clear()
-    noteBlobRefsRef.current.clear()
-    summaryBackfillInFlightRef.current.clear()
-    trashLoadedRef.current = false
-  }, [cancelBackgroundSync])
-
-  const rememberDecryptedBody = useCallback((noteId, content) => {
-    const key = String(noteId)
-    decryptedBodyCacheRef.current.set(key, content)
-    decryptedBodyOrderRef.current = [
-      ...decryptedBodyOrderRef.current.filter((existingId) => existingId !== key),
-      key,
-    ]
-
-    while (decryptedBodyOrderRef.current.length > 10) {
-      const evictedKey = decryptedBodyOrderRef.current.shift()
-      if (evictedKey) {
-        decryptedBodyCacheRef.current.delete(evictedKey)
-
-        const retainedBlobIds = new Set()
-        for (const retainedNoteId of decryptedBodyOrderRef.current) {
-          const retainedNoteBlobIds = noteBlobRefsRef.current.get(retainedNoteId)
-          if (!retainedNoteBlobIds) {
-            continue
-          }
-
-          for (const blobId of retainedNoteBlobIds) {
-            retainedBlobIds.add(blobId)
-          }
+    const next = createNoteStore({
+      api,
+      codec: authMode === 'e2ee' ? createE2EECodec(vault) : createLegacyCodec(),
+      userId,
+      getProfileReference: () => {
+        const { profile: current, profileIv: iv } = profileRef.current
+        if (!current) {
+          return undefined
         }
-
-        const evictedBlobIds = noteBlobRefsRef.current.get(evictedKey) || new Set()
-        for (const blobId of evictedBlobIds) {
-          if (!retainedBlobIds.has(blobId)) {
-            revokeBlobUrl(blobId)
-          }
-        }
-      }
-    }
-  }, [revokeBlobUrl])
-  const cacheUserId = authMode === 'e2ee' ? user?.id : null
-
-  const persistSummaryList = useCallback(
-    (scope, nextNotes) => {
-      const cacheKey = scope === 'trash' ? 'trash' : 'active'
-      rawSummaryListsRef.current[cacheKey] = nextNotes
-
-      if (!cacheUserId) {
-        return
-      }
-
-      void setCachedSummaryList(cacheUserId, cacheKey, nextNotes)
-    },
-    [cacheUserId]
-  )
-
-  const loadCachedSummaryList = useCallback(
-    async (scope) => {
-      const cacheKey = scope === 'trash' ? 'trash' : 'active'
-      if (!cacheUserId) {
-        return null
-      }
-
-      const cachedNotes = await getCachedSummaryList(cacheUserId, cacheKey)
-      if (!cachedNotes) {
-        return null
-      }
-
-      rawSummaryListsRef.current[cacheKey] = cachedNotes
-      return cachedNotes
-    },
-    [cacheUserId]
-  )
-
-  const fetchSummaryListFromServer = useCallback(
-    async (scope) => {
-      const cacheKey = scope === 'trash' ? 'trash' : 'active'
-      const res = await fetch(scope === 'trash' ? '/api/notes/trash' : '/api/notes', {
-        credentials: 'include',
-      })
-      const data = await res.json()
-      if (!res.ok) {
-        throw new Error(data?.error || 'Failed to load notes')
-      }
-
-      const nextNotes = data.notes || []
-      persistSummaryList(cacheKey, nextNotes)
-      return nextNotes
-    },
-    [persistSummaryList]
-  )
-
-  const materializeRawSummaryList = useCallback(
-    async (scope, rawNotes) => {
-      if (authMode === 'e2ee') {
-        const materialized = await Promise.all(
-          rawNotes.map(async (note) =>
-            applySummaryToNote(note, await decryptNoteSummary(note.encrypted_summary, note.id))
-          )
-        )
-
-        return scope === 'trash' ? sortTrashNotes(materialized) : sortNotesByMostRecent(materialized)
-      }
-
-      const materialized = rawNotes.map((note) => applySummaryToNote(note, createNoteSummary(note.content)))
-      return scope === 'trash' ? sortTrashNotes(materialized) : sortNotesByMostRecent(materialized)
-    },
-    [authMode, decryptNoteSummary]
-  )
-
-  const updateRawSummaryList = useCallback(
-    (scope, updater) => {
-      const cacheKey = scope === 'trash' ? 'trash' : 'active'
-      const current = rawSummaryListsRef.current[cacheKey]
-      if (!current) {
-        return
-      }
-
-      persistSummaryList(cacheKey, updater(current))
-    },
-    [persistSummaryList]
-  )
-
-  const persistFullNoteRecord = useCallback(
-    (note) => {
-      if (!cacheUserId || !note?.id) {
-        return
-      }
-
-      void setCachedNote(cacheUserId, note)
-    },
-    [cacheUserId]
-  )
-
-  const deletePersistentNoteCaches = useCallback(
-    (noteId) => {
-      if (!cacheUserId) {
-        return
-      }
-
-      void Promise.all([
-        deleteCachedNote(cacheUserId, noteId),
-        deleteCachedSearchEntry(cacheUserId, noteId),
-      ])
-    },
-    [cacheUserId]
-  )
-
-  const persistSearchIndex = useCallback(
-    async (noteId, updatedAt, searchText) => {
-      if (!cacheUserId || typeof searchText !== 'string') {
-        return
-      }
-
-      try {
-        const encryptedSearchText = await encryptNoteSearchText(noteId, searchText)
-        await setCachedSearchEntry(cacheUserId, noteId, encryptedSearchText, updatedAt)
-      } catch {
-        // local cache writes should never block the editor
-      }
-    },
-    [cacheUserId, encryptNoteSearchText]
-  )
-
-  const hydrateCachedSearchIndex = useCallback(
-    async (noteList) => {
-      if (!cacheUserId || vaultLocked || !noteList.length) {
-        return
-      }
-
-      await Promise.all(
-        noteList.map(async (note) => {
-          const key = String(note.id)
-          if (indexedNoteIdsRef.current.has(key)) {
-            return
-          }
-
-          try {
-            const cachedEntry = await getCachedSearchEntry(cacheUserId, note.id)
-            if (
-              !cachedEntry ||
-              String(cachedEntry.updatedAt || '') !== String(note.updated_at || '')
-            ) {
-              return
-            }
-
-            const cachedSearchText = await decryptNoteSearchText(note.id, cachedEntry.encryptedSearchText)
-            if (typeof cachedSearchText !== 'string') {
-              return
-            }
-
-            noteSearchIndexRef.current.set(key, cachedSearchText)
-            indexedNoteIdsRef.current.add(key)
-          } catch {
-            // ignore unreadable cache entries and let background sync rebuild them
-          }
-        })
-      )
-    },
-    [cacheUserId, decryptNoteSearchText, vaultLocked]
-  )
-
-  const getKnownNoteRecord = useCallback((noteId) => {
-    const key = String(noteId)
-    return (
-      notesRef.current.find((note) => String(note.id) === key) ||
-      trashNotesRef.current.find((note) => String(note.id) === key) ||
-      rawSummaryListsRef.current.active?.find((note) => String(note.id) === key) ||
-      rawSummaryListsRef.current.trash?.find((note) => String(note.id) === key) ||
-      null
-    )
-  }, [])
-
-  const invalidateInMemoryNoteCache = useCallback((noteId) => {
-    const key = String(noteId)
-    fullNoteCacheRef.current.delete(key)
-    decryptedBodyCacheRef.current.delete(key)
-    decryptedBodyOrderRef.current = decryptedBodyOrderRef.current.filter((cachedId) => cachedId !== key)
-    noteSearchIndexRef.current.delete(key)
-    indexedNoteIdsRef.current.delete(key)
-  }, [])
-
-  const reconcileCachedNoteState = useCallback(
-    (noteList) => {
-      for (const note of noteList) {
-        const previousNote = getKnownNoteRecord(note.id)
-        if (
-          previousNote &&
-          String(previousNote.updated_at || '') !== String(note.updated_at || '')
-        ) {
-          invalidateInMemoryNoteCache(note.id)
-        }
-      }
-    },
-    [getKnownNoteRecord, invalidateInMemoryNoteCache]
-  )
-
-  const applyBackfilledSummary = useCallback(
-    (noteId, summary, encryptedSummary) => {
-      const normalizedSummary = normalizeSummary(summary)
-
-      setNotes((prev) =>
-        sortNotesByMostRecent(
-          prev.map((note) =>
-            String(note.id) === String(noteId)
-              ? {
-                  ...note,
-                  encrypted_summary: encryptedSummary,
-                  summary: normalizedSummary,
-                }
-              : note
-          )
-        )
-      )
-
-      setTrashNotes((prev) =>
-        sortTrashNotes(
-          prev.map((note) =>
-            String(note.id) === String(noteId)
-              ? {
-                  ...note,
-                  encrypted_summary: encryptedSummary,
-                  summary: normalizedSummary,
-                }
-              : note
-          )
-        )
-      )
-
-      updateRawSummaryList('active', (prev) =>
-        prev.map((note) =>
-          String(note.id) === String(noteId) ? { ...note, encrypted_summary: encryptedSummary } : note
-        )
-      )
-      updateRawSummaryList('trash', (prev) =>
-        prev.map((note) =>
-          String(note.id) === String(noteId) ? { ...note, encrypted_summary: encryptedSummary } : note
-        )
-      )
-
-      const cachedNote = fullNoteCacheRef.current.get(String(noteId))
-      if (cachedNote) {
-        const updatedCachedNote = {
-          ...cachedNote,
-          encrypted_summary: encryptedSummary,
-        }
-        fullNoteCacheRef.current.set(String(noteId), updatedCachedNote)
-        persistFullNoteRecord(updatedCachedNote)
-      }
-    },
-    [persistFullNoteRecord, updateRawSummaryList]
-  )
-
-  const getFullNoteRecord = useCallback(
-    async (noteId, signal) => {
-      const key = String(noteId)
-      if (fullNoteCacheRef.current.has(key)) {
-        return fullNoteCacheRef.current.get(key)
-      }
-
-      const knownNote = getKnownNoteRecord(noteId)
-      if (cacheUserId) {
-        try {
-          const cachedNote = await getCachedNote(cacheUserId, noteId)
-          if (
-            cachedNote &&
-            (!knownNote?.updated_at ||
-              String(cachedNote.updated_at || '') === String(knownNote.updated_at || ''))
-          ) {
-            fullNoteCacheRef.current.set(key, cachedNote)
-            return cachedNote
-          }
-        } catch {
-          // ignore local cache failures and fall back to the network
-        }
-      }
-
-      const res = await fetch(`/api/notes/${noteId}`, {
-        credentials: 'include',
-        signal,
-      })
-      const data = await res.json()
-      if (!res.ok) {
-        throw new Error(data?.error || 'Failed to load note')
-      }
-
-      const note = data.note
-      fullNoteCacheRef.current.set(key, note)
-      persistFullNoteRecord(note)
-      return note
-    },
-    [cacheUserId, getKnownNoteRecord, persistFullNoteRecord]
-  )
-
-  const ensureNoteBodyLoaded = useCallback(
-    async (noteId, { scope = 'active', signal, retainDecrypted = false } = {}) => {
-      const key = String(noteId)
-      const cachedContent = decryptedBodyCacheRef.current.get(key)
-
-      if (cachedContent) {
-        if (scope === 'active') {
-          const cachedSearchText = createNoteSearchText(cachedContent)
-          noteSearchIndexRef.current.set(key, cachedSearchText)
-          indexedNoteIdsRef.current.add(key)
-          void persistSearchIndex(noteId, getKnownNoteRecord(noteId)?.updated_at, cachedSearchText)
-        }
-        noteBlobRefsRef.current.set(key, extractBlobIdsFromContent(cachedContent))
-        return cachedContent
-      }
-
-      const fullNote = await getFullNoteRecord(noteId, signal)
-      const content =
-        authMode === 'e2ee'
-          ? (await decryptNoteContent(fullNote)) || createEmptyNoteContent()
-          : fullNote.content || createEmptyNoteContent()
-      const searchText = createNoteSearchText(content)
-
-      noteBlobRefsRef.current.set(key, extractBlobIdsFromContent(content))
-
-      if (scope === 'active') {
-        noteSearchIndexRef.current.set(key, searchText)
-        indexedNoteIdsRef.current.add(key)
-        void persistSearchIndex(noteId, fullNote.updated_at, searchText)
-      }
-
-      if (retainDecrypted) {
-        rememberDecryptedBody(noteId, content)
-      }
-
-      if (
-        authMode === 'e2ee' &&
-        !fullNote.encrypted_summary &&
-        !summaryBackfillInFlightRef.current.has(key)
-      ) {
-        summaryBackfillInFlightRef.current.add(key)
-
-        try {
-          const summary = createNoteSummary(content)
-          const encryptedSummary = await encryptNoteSummary(summary, noteId)
-          const res = await fetch(`/api/notes/${noteId}/summary`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'include',
-            body: JSON.stringify({ encryptedSummary }),
-          })
-          const data = await res.json()
-          if (!res.ok) {
-            throw new Error(data?.error || 'Failed to save note summary')
-          }
-
-          applyBackfilledSummary(noteId, summary, encryptedSummary)
-          fullNoteCacheRef.current.set(key, {
-            ...fullNote,
-            encrypted_summary: encryptedSummary,
-          })
-        } catch {
-          // keep the placeholder summary if the backfill fails
-        } finally {
-          summaryBackfillInFlightRef.current.delete(key)
-        }
-      }
-
-      return content
-    },
-    [
-      applyBackfilledSummary,
-      authMode,
-      decryptNoteContent,
-      encryptNoteSummary,
-      extractBlobIdsFromContent,
-      getFullNoteRecord,
-      getKnownNoteRecord,
-      persistSearchIndex,
-      rememberDecryptedBody,
-    ]
-  )
-
-  const startBackgroundSync = useCallback(
-    (noteList, focusNoteId = null) => {
-      if (authMode !== 'e2ee') {
-        updateSearchStatus(noteList, false)
-        return
-      }
-
-      const orderedIds = prioritizeNoteIds(noteList, focusNoteId)
-      if (!orderedIds.length) {
-        updateSearchStatus(noteList, false)
-        return
-      }
-
-      cancelBackgroundSync()
-
-      const token = backgroundSyncStateRef.current.token
-      const pendingIds = orderedIds.filter((noteId) => !indexedNoteIdsRef.current.has(String(noteId)))
-      if (!pendingIds.length) {
-        updateSearchStatus(noteList, false)
-        return
-      }
-
-      updateSearchStatus(noteList, true)
-
-      let index = 0
-      const workerCount = Math.min(3, pendingIds.length)
-
-      const worker = async () => {
-        while (backgroundSyncStateRef.current.token === token && index < pendingIds.length) {
-          const noteId = pendingIds[index]
-          index += 1
-
-          const controller = new AbortController()
-          backgroundSyncStateRef.current.controllers.add(controller)
-
-          try {
-            await ensureNoteBodyLoaded(noteId, {
-              scope: 'active',
-              signal: controller.signal,
-              retainDecrypted: false,
-            })
-          } catch (error) {
-            if (error?.name === 'AbortError') {
-              return
-            }
-          } finally {
-            backgroundSyncStateRef.current.controllers.delete(controller)
-            if (backgroundSyncStateRef.current.token === token) {
-              updateSearchStatus(noteList, true)
-            }
-          }
-        }
-      }
-
-      void Promise.all(Array.from({ length: workerCount }, worker)).then(() => {
-        if (backgroundSyncStateRef.current.token === token) {
-          updateSearchStatus(noteList, false)
-        }
-      })
-    },
-    [authMode, cancelBackgroundSync, ensureNoteBodyLoaded, updateSearchStatus]
-  )
-
-  const canSafelyDeleteBlobs = useCallback(() => {
-    if (!trashLoadedRef.current) {
-      return false
-    }
-
-    const allKnownNotes = [...notesRef.current, ...trashNotesRef.current]
-    return allKnownNotes.every((note) => noteBlobRefsRef.current.has(String(note.id)))
-  }, [])
-
-  const collectReferencedBlobIds = useCallback((excludedNoteId) => {
-    const ids = new Set()
-
-    for (const note of [...notesRef.current, ...trashNotesRef.current]) {
-      if (String(note.id) === String(excludedNoteId)) {
-        continue
-      }
-
-      const blobIds = noteBlobRefsRef.current.get(String(note.id))
-      if (!blobIds) {
-        continue
-      }
-
-      for (const blobId of blobIds) {
-        ids.add(blobId)
-      }
-    }
-
-    return ids
-  }, [])
-
-  useEffect(() => {
-    function handleKeyDown(e) {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'j') {
-        e.preventDefault()
-        e.stopPropagation()
-        newNoteRef.current?.()
-      }
-      if ((e.metaKey || e.ctrlKey) && e.key === 'd') {
-        e.preventDefault()
-        e.stopPropagation()
-        deleteNoteRef.current?.()
-        return
-      }
-
-      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) {
-        return
-      }
-
-      if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') {
-        return
-      }
-
-      if (document.querySelector('.modal-overlay') || isEditableTarget(e.target)) {
-        return
-      }
-
-      const handled = arrowNavigationRef.current?.(e.key === 'ArrowDown' ? 1 : -1)
-
-      if (handled) {
-        e.preventDefault()
-        e.stopPropagation()
-      }
-    }
-
-    window.addEventListener('keydown', handleKeyDown, true)
-    return () => window.removeEventListener('keydown', handleKeyDown, true)
-  }, [])
-
-  useEffect(() => {
-    if (authMode !== 'e2ee' || !vaultLocked) {
-      return
-    }
-
-    Promise.all([loadCachedSummaryList('active'), loadCachedSummaryList('trash')]).catch(() => {
-      // ignore cache misses and fall through to the network prefetch
+        return { blobId: current.profile_picture_blob_id ? Number(current.profile_picture_blob_id) : null, profileIv: iv }
+      },
     })
-
-    Promise.all([fetchSummaryListFromServer('active'), fetchSummaryListFromServer('trash')]).catch(() => {
-      // keep the lock screen quiet if the prefetch fails
-    })
-  }, [authMode, fetchSummaryListFromServer, loadCachedSummaryList, vaultLocked])
-
-  const fetchNotes = useCallback(async () => {
-    setNotesLoading(true)
-    let hydratedFromCache = false
-
-    try {
-      const cachedRawNotes = await loadCachedSummaryList('active')
-      if (cachedRawNotes) {
-        const cachedNotes = await materializeRawSummaryList('active', cachedRawNotes)
-        await hydrateCachedSearchIndex(cachedNotes)
-
-        const cachedActiveId =
-          activeNoteIdRef.current && cachedNotes.some((note) => note.id === activeNoteIdRef.current)
-            ? activeNoteIdRef.current
-            : cachedNotes[0]?.id || null
-
-        setNotes(cachedNotes)
-        setActiveNoteId(cachedActiveId)
-        updateSearchStatus(cachedNotes, false)
-        startBackgroundSync(cachedNotes, cachedActiveId)
-        hydratedFromCache = true
-        setNotesLoading(false)
-      }
-
-      const latestRawNotes = await fetchSummaryListFromServer('active')
-      const nextNotes = await materializeRawSummaryList('active', latestRawNotes)
-      reconcileCachedNoteState(nextNotes)
-      await hydrateCachedSearchIndex(nextNotes)
-      const nextActiveId =
-        activeNoteIdRef.current && nextNotes.some((note) => note.id === activeNoteIdRef.current)
-          ? activeNoteIdRef.current
-          : nextNotes[0]?.id || null
-
-      setNotes(nextNotes)
-      setActiveNoteId(nextActiveId)
-      updateSearchStatus(nextNotes, false)
-      startBackgroundSync(nextNotes, nextActiveId)
-    } catch (error) {
-      if (!hydratedFromCache) {
-        toast.error(error.message || 'Failed to load notes')
-      }
-    } finally {
-      setNotesLoading(false)
-    }
-  }, [
-    fetchSummaryListFromServer,
-    hydrateCachedSearchIndex,
-    loadCachedSummaryList,
-    materializeRawSummaryList,
-    reconcileCachedNoteState,
-    startBackgroundSync,
-    updateSearchStatus,
-  ])
-
-  const fetchTrash = useCallback(async () => {
-    setTrashLoading(true)
-    let hydratedFromCache = false
-
-    try {
-      const cachedRawTrashNotes = await loadCachedSummaryList('trash')
-      if (cachedRawTrashNotes) {
-        const cachedTrashNotes = await materializeRawSummaryList('trash', cachedRawTrashNotes)
-        trashLoadedRef.current = true
-        setTrashNotes(cachedTrashNotes)
-        setActiveTrashNoteId((prev) =>
-          prev && cachedTrashNotes.some((note) => note.id === prev)
-            ? prev
-            : cachedTrashNotes[0]?.id || null
-        )
-        hydratedFromCache = true
-        setTrashLoading(false)
-      }
-
-      const latestRawTrashNotes = await fetchSummaryListFromServer('trash')
-      const nextTrashNotes = await materializeRawSummaryList('trash', latestRawTrashNotes)
-      reconcileCachedNoteState(nextTrashNotes)
-      trashLoadedRef.current = true
-      setTrashNotes(nextTrashNotes)
-      setActiveTrashNoteId((prev) =>
-        prev && nextTrashNotes.some((note) => note.id === prev) ? prev : nextTrashNotes[0]?.id || null
-      )
-    } catch (error) {
-      if (!hydratedFromCache) {
-        toast.error(error.message || 'Failed to load trash')
-      }
-    } finally {
-      setTrashLoading(false)
-    }
-  }, [
-    fetchSummaryListFromServer,
-    loadCachedSummaryList,
-    materializeRawSummaryList,
-    reconcileCachedNoteState,
-  ])
-
-  useEffect(() => {
-    if (vaultLocked) {
-      setNotes([])
-      setActiveNoteId(null)
-      setTrashNotes([])
-      setTrashView(false)
-      setActiveTrashNoteId(null)
-      setActiveNoteContent(null)
-      setActiveNoteContentId(null)
-      setActiveTrashNoteContent(null)
-      setActiveTrashNoteContentId(null)
-      setActiveNoteLoading(false)
-      setActiveTrashNoteLoading(false)
-      clearSessionCaches()
-      return
-    }
-
-    fetchNotes()
-
+    setStore(next)
+    void next.start()
     return () => {
-      cancelBackgroundSync()
+      next.stop()
+      setStore(null)
     }
-  }, [cancelBackgroundSync, clearSessionCaches, fetchNotes, vaultLocked])
+  }, [api, authMode, userId, vault])
 
   useEffect(() => {
-    if (!editorShouldAutoFocus || !activeNoteId) {
+    if (authMode !== 'e2ee' || !vault) {
       return
     }
+    api
+      .get('/api/blobs/usage')
+      .then(setLimits)
+      .catch(() => {})
+  }, [api, authMode, vault])
 
-    setEditorShouldAutoFocus(false)
-  }, [activeNoteId, editorShouldAutoFocus])
-
+  // Unsent edits are encrypted into the outbox before the vault locks; a
+  // lock is refused rather than ever dropping typed text.
   useEffect(() => {
-    if (trashView || !activeNoteId || vaultLocked) {
-      setActiveNoteContent(null)
-      setActiveNoteContentId(null)
-      setActiveNoteLoading(false)
-      return
+    if (!store) {
+      return undefined
     }
-
-    const requestedNoteId = String(activeNoteId)
-    const cachedContent = decryptedBodyCacheRef.current.get(requestedNoteId)
-    if (cachedContent) {
-      setActiveNoteContent(cachedContent)
-      setActiveNoteContentId(requestedNoteId)
-      setActiveNoteLoading(false)
-      return
-    }
-
-    const controller = new AbortController()
-    setActiveNoteLoading(true)
-    setActiveNoteContentId(null)
-
-    ensureNoteBodyLoaded(requestedNoteId, {
-      scope: 'active',
-      signal: controller.signal,
-      retainDecrypted: true,
+    const offLock = registerLockHandler(async () => {
+      editorRef.current?.flush()
+      await store.flushAll()
+      return !store.hasVolatileChanges()
     })
-      .then((content) => {
-        if (String(activeNoteIdRef.current) !== requestedNoteId) {
-          return
+    const offResume = registerResumeHandler(() => store.resumeAfterAuth())
+    return () => {
+      offLock()
+      offResume()
+    }
+  }, [registerLockHandler, registerResumeHandler, store])
+
+  // Store events: remote edits, removals, rollbacks, missing attachments.
+  useEffect(() => {
+    if (!store) {
+      return undefined
+    }
+    return store.onEvent((event) => {
+      if (event.type === 'note-replaced') {
+        setReloadToken((value) => value + 1)
+        if (event.reason === 'remote') {
+          toast('This note was updated on another device.', { icon: '🔄' })
         }
-        setActiveNoteContent(content)
-        setActiveNoteContentId(requestedNoteId)
-        setActiveNoteLoading(false)
-        updateSearchStatus(notesRef.current, searchStatus.running)
+      } else if (event.type === 'note-removed' && event.reason === 'deleted') {
+        setRemovedNotice(event.id)
+      } else if (event.type === 'rollback') {
+        toast.error('The server returned an older version of a note than this device has seen. Check its history.', {
+          duration: 10000,
+        })
+      } else if (event.type === 'missing-attachments') {
+        toast.error('Some attachments in this note are no longer available on the server.')
+      } else if (event.type === 'key-rotated') {
+        toast.error('Your encryption key changed on another device. Lock and unlock to continue saving.', {
+          duration: 10000,
+        })
+      }
+    })
+  }, [store])
+
+  // DATA-3: learn about edits made elsewhere when the tab comes back, on
+  // focus and periodically while visible.
+  useEffect(() => {
+    if (!store) {
+      return undefined
+    }
+    const syncSoon = () => {
+      if (document.visibilityState !== 'visible' || Date.now() - lastSyncRef.current < MIN_SYNC_GAP_MS) {
+        return
+      }
+      lastSyncRef.current = Date.now()
+      void store.sync()
+    }
+    document.addEventListener('visibilitychange', syncSoon)
+    window.addEventListener('focus', syncSoon)
+    window.addEventListener('online', syncSoon)
+    const timer = window.setInterval(syncSoon, SYNC_INTERVAL_MS)
+    return () => {
+      document.removeEventListener('visibilitychange', syncSoon)
+      window.removeEventListener('focus', syncSoon)
+      window.removeEventListener('online', syncSoon)
+      window.clearInterval(timer)
+    }
+  }, [store])
+
+  // DATA-2: closing the tab with unsent changes asks first.
+  useEffect(() => {
+    if (!store) {
+      return undefined
+    }
+    const handleBeforeUnload = (event) => {
+      editorRef.current?.flush()
+      if (store.hasUnsavedChanges()) {
+        event.preventDefault()
+        event.returnValue = ''
+      }
+    }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload)
+  }, [store])
+
+  // The selection falls back to the newest note when the chosen one leaves
+  // the list (trashed or deleted elsewhere), derived rather than stored.
+  const activeStillListed =
+    activeId != null && (snapshot.notes.some((note) => note.id === activeId) || removedNotice === activeId)
+  const currentId = activeStillListed ? activeId : snapshot.status === 'ready' ? (snapshot.notes[0]?.id ?? null) : null
+  const openId = trashView ? activeTrashId : currentId
+  const requestKey = openId == null ? null : `${trashView ? 'trash' : 'note'}:${openId}:${reloadToken}`
+
+  // Load the open note's body.
+  useEffect(() => {
+    if (!store || openId == null) {
+      return undefined
+    }
+    let cancelled = false
+    const controller = new AbortController()
+    store
+      .openNote(openId, { signal: controller.signal })
+      .then((result) => {
+        if (!cancelled) {
+          setLoaded({ key: requestKey, content: result.content, error: null, rollback: result.rollback, token: Date.now() })
+        }
       })
       .catch((error) => {
-        if (error?.name === 'AbortError') {
-          return
+        if (!cancelled && error?.name !== 'AbortError') {
+          setLoaded({ key: requestKey, content: null, error, rollback: null, token: Date.now() })
         }
-
-        if (String(activeNoteIdRef.current) !== requestedNoteId) {
-          return
-        }
-
-        setActiveNoteLoading(false)
-        toast.error(error.message || 'Failed to load note')
       })
-
-    return () => controller.abort()
-  }, [
-    activeNoteId,
-    ensureNoteBodyLoaded,
-    searchStatus.running,
-    trashView,
-    updateSearchStatus,
-    vaultLocked,
-  ])
-
-  useEffect(() => {
-    if (!trashView || !activeTrashNoteId || vaultLocked) {
-      setActiveTrashNoteContent(null)
-      setActiveTrashNoteContentId(null)
-      setActiveTrashNoteLoading(false)
-      return
+    return () => {
+      cancelled = true
+      controller.abort()
+      store.closeNote(openId)
     }
+  }, [openId, requestKey, store])
 
-    const requestedTrashNoteId = String(activeTrashNoteId)
-    const cachedContent = decryptedBodyCacheRef.current.get(requestedTrashNoteId)
-    if (cachedContent) {
-      setActiveTrashNoteContent(cachedContent)
-      setActiveTrashNoteContentId(requestedTrashNoteId)
-      setActiveTrashNoteLoading(false)
-      return
-    }
-
-    const controller = new AbortController()
-    setActiveTrashNoteLoading(true)
-    setActiveTrashNoteContentId(null)
-
-    ensureNoteBodyLoaded(requestedTrashNoteId, {
-      scope: 'trash',
-      signal: controller.signal,
-      retainDecrypted: true,
-    })
-      .then((content) => {
-        if (String(activeTrashNoteIdRef.current) !== requestedTrashNoteId) {
-          return
-        }
-        setActiveTrashNoteContent(content)
-        setActiveTrashNoteContentId(requestedTrashNoteId)
-        setActiveTrashNoteLoading(false)
-      })
-      .catch((error) => {
-        if (error?.name === 'AbortError') {
-          return
-        }
-
-        if (String(activeTrashNoteIdRef.current) !== requestedTrashNoteId) {
-          return
-        }
-
-        setActiveTrashNoteLoading(false)
-        toast.error(error.message || 'Failed to load note')
-      })
-
-    return () => controller.abort()
-  }, [activeTrashNoteId, ensureNoteBodyLoaded, trashView, vaultLocked])
-
-  const normalizedSearchQuery = searchQuery.trim().toLowerCase()
-  const visibleNotes = normalizedSearchQuery
-    ? notes.filter((note) =>
-        noteMatchesQuery(
-          note,
-          normalizedSearchQuery,
-          noteSearchIndexRef.current.get(String(note.id))
-        )
-      )
-    : notes
-
-  arrowNavigationRef.current = (direction) => {
-    if (trashView) {
-      const nextTrashNoteId = getAdjacentNoteId(trashNotes, activeTrashNoteId, direction)
-
-      if (!nextTrashNoteId) {
-        return false
+  const selectNote = useCallback(
+    (id) => {
+      editorRef.current?.flush()
+      if (trashView) {
+        setTrashView(false)
       }
-
-      if (nextTrashNoteId !== activeTrashNoteId) {
-        setActiveTrashNoteId(nextTrashNoteId)
-      }
-
-      return true
-    }
-
-    const nextNoteId = getAdjacentNoteId(visibleNotes, activeNoteId, direction)
-
-    if (!nextNoteId) {
-      return false
-    }
-
-    if (nextNoteId !== activeNoteId) {
-      setEditorShouldAutoFocus(false)
-      setActiveNoteId(nextNoteId)
-    }
-
-    return true
-  }
-
-  async function handleNewNote() {
-    if (trashView) return
-
-    try {
-      const content = createEmptyNoteContent()
-      const summary = createNoteSummary(content)
-      const searchText = createNoteSearchText(content)
-      let encryptedContent = null
-      let encryptedSummary = null
-      let data
-
-      if (authMode === 'e2ee') {
-        // Create the row first so the ciphertexts can be bound to the note id.
-        const createRes = await fetch('/api/notes', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'include',
-          body: JSON.stringify({}),
-        })
-        const createData = await createRes.json()
-        if (!createRes.ok) {
-          throw new Error(createData?.error || 'Failed to create note')
-        }
-
-        const noteId = createData.note.id
-        encryptedContent = await encryptNoteContent(content, noteId)
-        encryptedSummary = await encryptNoteSummary(summary, noteId)
-
-        const putRes = await fetch(`/api/notes/${noteId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'include',
-          body: JSON.stringify({ encryptedContent, encryptedSummary }),
-        })
-        data = await putRes.json()
-        if (!putRes.ok) {
-          throw new Error(data?.error || 'Failed to create note')
-        }
-      } else {
-        const res = await fetch('/api/notes', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'include',
-          body: JSON.stringify({ content }),
-        })
-        data = await res.json()
-        if (!res.ok) {
-          throw new Error(data?.error || 'Failed to create note')
-        }
-      }
-
-      const nextNote =
-        authMode === 'e2ee'
-          ? applySummaryToNote(
-              {
-                ...data.note,
-                encrypted_summary: encryptedSummary,
-              },
-              summary
-            )
-          : applySummaryToNote(data.note, createNoteSummary(content))
-
-      setNotes((prev) => {
-        const nextNotes = sortNotesByMostRecent([nextNote, ...prev])
-        updateSearchStatus(nextNotes, searchStatus.running)
-        return nextNotes
-      })
-      updateRawSummaryList('active', (prev) => [data.note, ...prev])
-
-      if (authMode === 'e2ee') {
-        const fullNoteRecord = {
-          ...data.note,
-          encrypted_content: encryptedContent,
-          encrypted_summary: encryptedSummary,
-        }
-        fullNoteCacheRef.current.set(String(nextNote.id), fullNoteRecord)
-        persistFullNoteRecord(fullNoteRecord)
-      }
-
-      noteSearchIndexRef.current.set(String(nextNote.id), searchText)
-      indexedNoteIdsRef.current.add(String(nextNote.id))
-      void persistSearchIndex(nextNote.id, nextNote.updated_at, searchText)
-      noteBlobRefsRef.current.set(String(nextNote.id), extractBlobIdsFromContent(content))
-      rememberDecryptedBody(nextNote.id, content)
-
-      setActiveNoteContent(content)
-      setEditorShouldAutoFocus(true)
-      setActiveNoteId(nextNote.id)
+      setRemovedNotice(null)
+      setAutoFocus(false)
+      setActiveId(id)
       if (window.innerWidth <= 768) setSidebarOpen(false)
-      toast.success('Note created')
+    },
+    [trashView]
+  )
+
+  const handleNewNote = useCallback(async () => {
+    if (!store) return
+    editorRef.current?.flush()
+    try {
+      const note = await store.createNote()
+      setTrashView(false)
+      setAutoFocus(true)
+      setActiveId(note.id)
+      if (window.innerWidth <= 768) setSidebarOpen(false)
     } catch (error) {
       toast.error(error.message || 'Failed to create note')
     }
-  }
+  }, [store])
 
-  newNoteRef.current = handleNewNote
-
-  async function handleSoftDeleteNote(noteId) {
-    try {
-      const deletedNote = notesRef.current.find((note) => note.id === noteId)
-      const res = await fetch(`/api/notes/${noteId}/trash`, {
-        method: 'PUT',
-        credentials: 'include',
-      })
-
-      if (!res.ok) {
-        const data = await res.json()
-        throw new Error(data?.error || 'Failed to delete note')
+  const handleTrash = useCallback(
+    async (id) => {
+      if (!store) return
+      if (id === currentId) {
+        editorRef.current?.flush()
       }
-
-      setNotes((prev) => {
-        const filtered = prev.filter((note) => note.id !== noteId)
-        updateSearchStatus(filtered, searchStatus.running)
-        if (activeNoteId === noteId) {
-          setEditorShouldAutoFocus(false)
-          setActiveNoteId(filtered.length > 0 ? filtered[0].id : null)
-          setActiveNoteContent(null)
-        }
-        return filtered
-      })
-      updateRawSummaryList('active', (prev) => prev.filter((note) => note.id !== noteId))
-      if (deletedNote && rawSummaryListsRef.current.trash) {
-        updateRawSummaryList('trash', (prev) => [
-          {
-            ...deletedNote,
-            deleted_at: new Date().toISOString(),
-          },
-          ...prev.filter((note) => note.id !== noteId),
-        ])
-      }
-      noteSearchIndexRef.current.delete(String(noteId))
-      indexedNoteIdsRef.current.delete(String(noteId))
-      toast.success('Note moved to trash')
-    } catch (error) {
-      toast.error(error.message || 'Failed to delete note')
-    }
-  }
-
-  function handleDeleteActiveNote() {
-    if (trashView || !activeNoteId) return
-    handleSoftDeleteNote(activeNoteId)
-  }
-
-  deleteNoteRef.current = handleDeleteActiveNote
-
-  async function handleRestoreNote(noteId) {
-    try {
-      const res = await fetch(`/api/notes/${noteId}/restore`, {
-        method: 'PUT',
-        credentials: 'include',
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data?.error || 'Failed to restore note')
-
-      const existingTrashNote = trashNotesRef.current.find((note) => note.id === noteId)
-      const restoredSummary =
-        authMode === 'e2ee'
-          ? await decryptNoteSummary(data.note.encrypted_summary, data.note.id)
-          : createNoteSummary(data.note.content || existingTrashNote?.content || createEmptyNoteContent())
-
-      const restoredNote = applySummaryToNote(data.note, restoredSummary || existingTrashNote?.summary)
-
-      const nextTrashNotes = trashNotesRef.current.filter((note) => note.id !== noteId)
-      const nextActiveNotes = sortNotesByMostRecent([restoredNote, ...notesRef.current])
-
-      setTrashNotes(nextTrashNotes)
-      updateRawSummaryList('trash', (prev) => prev.filter((note) => note.id !== noteId))
-      setNotes(nextActiveNotes)
-      updateSearchStatus(nextActiveNotes, searchStatus.running)
-      updateRawSummaryList('active', (prev) => [data.note, ...(prev || [])])
-
-      if (String(activeTrashNoteId) === String(noteId)) {
-        setActiveTrashNoteContent(null)
-        setActiveTrashNoteId(nextTrashNotes[0]?.id || null)
-      }
-
-      if (authMode === 'e2ee') {
-        startBackgroundSync(nextActiveNotes, restoredNote.id)
-      }
-
-      toast.success('Note restored')
-    } catch (error) {
-      toast.error(error.message || 'Failed to restore note')
-    }
-  }
-
-  async function handlePermanentDelete(noteId) {
-    try {
-      const res = await fetch(`/api/notes/${noteId}`, {
-        method: 'DELETE',
-        credentials: 'include',
-      })
-
-      if (!res.ok) {
-        const data = await res.json()
-        throw new Error(data?.error || 'Failed to delete note')
-      }
-
-      if (authMode === 'e2ee' && canSafelyDeleteBlobs()) {
-        const currentBlobIds = noteBlobRefsRef.current.get(String(noteId)) || new Set()
-        const referencedBlobIds = collectReferencedBlobIds(noteId)
-        const removableBlobIds = [...currentBlobIds].filter((blobId) => !referencedBlobIds.has(blobId))
-        await Promise.all(removableBlobIds.map((blobId) => deleteBlob(blobId)))
-      }
-
-      const nextTrashNotes = trashNotesRef.current.filter((note) => note.id !== noteId)
-      setTrashNotes(nextTrashNotes)
-      updateRawSummaryList('trash', (prev) => prev.filter((note) => note.id !== noteId))
-      noteBlobRefsRef.current.delete(String(noteId))
-      noteSearchIndexRef.current.delete(String(noteId))
-      indexedNoteIdsRef.current.delete(String(noteId))
-      fullNoteCacheRef.current.delete(String(noteId))
-      decryptedBodyCacheRef.current.delete(String(noteId))
-      decryptedBodyOrderRef.current = decryptedBodyOrderRef.current.filter(
-        (cachedId) => cachedId !== String(noteId)
-      )
-
-      if (String(activeTrashNoteId) === String(noteId)) {
-        setActiveTrashNoteContent(null)
-        setActiveTrashNoteId(nextTrashNotes[0]?.id || null)
-      }
-
-      deletePersistentNoteCaches(noteId)
-      toast.success('Note permanently deleted')
-    } catch (error) {
-      toast.error(error.message || 'Failed to delete note')
-    }
-  }
-
-  async function handleUpdateNote(noteId, content) {
-    const previousContent =
-      activeNoteId === noteId
-        ? activeNoteContent
-        : decryptedBodyCacheRef.current.get(String(noteId)) || createEmptyNoteContent()
-    const previousBlobIds = extractBlobIdsFromContent(previousContent)
-
-    try {
-      const summary = createNoteSummary(content)
-      const searchText = createNoteSearchText(content)
-      const payload =
-        authMode === 'e2ee'
-          ? {
-              encryptedContent: await encryptNoteContent(content, noteId),
-              encryptedSummary: await encryptNoteSummary(summary, noteId),
-            }
-          : { content }
-
-      const res = await fetch(`/api/notes/${noteId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify(payload),
-      })
-
-      const data = await res.json()
-      if (!res.ok) {
-        throw new Error(data?.error || 'Failed to update note')
-      }
-
-      const nextNote =
-        authMode === 'e2ee'
-          ? applySummaryToNote(
-              {
-                ...data.note,
-                encrypted_summary: payload.encryptedSummary,
-              },
-              summary
-            )
-          : applySummaryToNote(data.note, summary)
-
-      setNotes((prev) => sortNotesByMostRecent(prev.map((note) => (note.id === noteId ? nextNote : note))))
-      updateRawSummaryList('active', (prev) =>
-        prev.map((note) => (note.id === noteId ? { ...note, ...data.note } : note))
-      )
-
-      if (authMode === 'e2ee') {
-        const fullNoteRecord = {
-          ...(fullNoteCacheRef.current.get(String(noteId)) || {}),
-          ...data.note,
-          encrypted_content: payload.encryptedContent,
-          encrypted_summary: payload.encryptedSummary,
-        }
-        fullNoteCacheRef.current.set(String(noteId), fullNoteRecord)
-        persistFullNoteRecord(fullNoteRecord)
-      }
-
-      noteSearchIndexRef.current.set(String(noteId), searchText)
-      indexedNoteIdsRef.current.add(String(noteId))
-      void persistSearchIndex(noteId, data.note.updated_at, searchText)
-      noteBlobRefsRef.current.set(String(noteId), extractBlobIdsFromContent(content))
-      rememberDecryptedBody(noteId, content)
-
-      if (String(activeNoteId) === String(noteId)) {
-        setActiveNoteContent(content)
-      }
-
-      if (authMode === 'e2ee' && canSafelyDeleteBlobs()) {
-        const nextBlobIds = extractBlobIdsFromContent(content)
-        const referencedBlobIds = collectReferencedBlobIds(noteId)
-        const removedBlobIds = [...previousBlobIds].filter(
-          (blobId) => !nextBlobIds.has(blobId) && !referencedBlobIds.has(blobId)
+      try {
+        await store.trashNote(id)
+        toast(
+          (t) => (
+            <span className="toast-with-action">
+              Moved to trash
+              <button
+                type="button"
+                className="btn-link"
+                onClick={async () => {
+                  toast.dismiss(t.id)
+                  await store.restoreNote(id)
+                  setActiveId(id)
+                }}
+              >
+                Undo
+              </button>
+            </span>
+          ),
+          { duration: 6000 }
         )
-        await Promise.all(removedBlobIds.map((blobId) => deleteBlob(blobId)))
+      } catch (error) {
+        toast.error(error.message || 'Failed to move the note to the trash')
       }
-    } catch {
-      // silent fail on auto-save
+    },
+    [currentId, store]
+  )
+
+  const handleRestore = useCallback(
+    async (id) => {
+      try {
+        await store.restoreNote(id)
+        toast.success('Note restored')
+        if (activeTrashId === id) {
+          setActiveTrashId(null)
+        }
+      } catch (error) {
+        toast.error(error.message || 'Failed to restore note')
+      }
+    },
+    [activeTrashId, store]
+  )
+
+  async function confirmPermanentDelete() {
+    const id = pendingDelete
+    try {
+      await store.deleteNotePermanently(id)
+      toast.success('Note permanently deleted')
+      if (activeTrashId === id) {
+        setActiveTrashId(null)
+      }
+    } catch (error) {
+      toast.error(error.message || 'Failed to delete note')
+    } finally {
+      setPendingDelete(null)
     }
   }
 
-  async function handleUploadImage(file) {
-    return uploadEncryptedBlob(file)
-  }
+  const visibleNotes = useMemo(() => {
+    if (!store || !searchQuery.trim()) {
+      return snapshot.notes
+    }
+    return store.searchMatches(searchQuery)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [store, searchQuery, snapshot.notes, snapshot.search.indexed])
 
-  function handleOpenTrash() {
-    setTrashView(true)
-    setActiveNoteId(null)
-    setActiveNoteContent(null)
-    setActiveNoteContentId(null)
-    setActiveTrashNoteId(null)
-    fetchTrash()
+  // Keyboard: Ctrl/Cmd+J new note, Ctrl/Cmd+D trash (DATA-9: never while
+  // typing, so it no longer hijacks the editor or the bookmark shortcut).
+  const keyboardRef = useRef(null)
+  const handleKeyDown = (event) => {
+    const mod = event.metaKey || event.ctrlKey
+    if (mod && !event.shiftKey && event.key.toLowerCase() === 'j') {
+      event.preventDefault()
+      void handleNewNote()
+      return
+    }
+    if (document.querySelector('.modal-overlay') || isEditableTarget(event.target)) {
+      return
+    }
+    if (mod && event.key.toLowerCase() === 'd' && !trashView && currentId != null) {
+      event.preventDefault()
+      void handleTrash(currentId)
+      return
+    }
+    if (event.altKey || mod || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) {
+      return
+    }
+    const direction = event.key === 'ArrowDown' ? 1 : -1
+    if (trashView) {
+      const next = adjacentId(snapshot.trash, activeTrashId, direction)
+      if (next != null) setActiveTrashId(next)
+    } else {
+      const next = adjacentId(visibleNotes, currentId, direction)
+      if (next != null) selectNote(next)
+    }
+    event.preventDefault()
   }
+  useEffect(() => {
+    keyboardRef.current = handleKeyDown
+  })
+  useEffect(() => {
+    const handler = (event) => keyboardRef.current?.(event)
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
 
-  function handleCloseTrash() {
-    setTrashView(false)
-    setActiveTrashNoteId(null)
-    setActiveTrashNoteContent(null)
-    setActiveTrashNoteContentId(null)
-    const firstNote = notesRef.current[0]
-    if (firstNote) setActiveNoteId(firstNote.id)
-  }
-
-  const activeNoteSummary = notes.find((note) => note.id === activeNoteId)
-  const activeTrashNoteSummary = trashNotes.find((note) => note.id === activeTrashNoteId)
-  const activeNoteHasMatchingContent =
-    activeNoteContent && String(activeNoteContentId) === String(activeNoteId)
-  const activeTrashNoteHasMatchingContent =
-    activeTrashNoteContent && String(activeTrashNoteContentId) === String(activeTrashNoteId)
-  const activeNote = activeNoteSummary
-    && activeNoteHasMatchingContent
-    ? {
-        ...activeNoteSummary,
-        content: activeNoteContent,
+  const uploadForEditor = useCallback(
+    (file) => {
+      if (!vault) {
+        return Promise.reject(new Error('Upgrade to encrypted storage to add attachments'))
       }
-    : null
-  const activeTrashNote = activeTrashNoteSummary
-    && activeTrashNoteHasMatchingContent
-    ? {
-        ...activeTrashNoteSummary,
-        content: activeTrashNoteContent,
+      return uploadFile({ api, vault, file })
+    },
+    [api, vault]
+  )
+
+  const handleChange = useCallback(
+    (json) => {
+      if (store && currentId != null) {
+        store.updateNote(currentId, json)
       }
-    : null
+    },
+    [currentId, store]
+  )
+
+  const openAttachment = useCallback(
+    (reference) => {
+      attachments.download(reference).catch((error) => toast.error(`Could not open the attachment: ${error.message}`))
+    },
+    [attachments]
+  )
 
   if (vaultLocked) {
     return <VaultUnlockScreen />
   }
+
+  const activeRecord = snapshot.notes.find((note) => note.id === currentId) || (store && currentId != null ? store.getNoteRecord(currentId) : null)
+  const saveState = currentId != null ? snapshot.saveStates[currentId] : null
+  const conflict = saveState?.state === 'conflict' ? saveState.conflict : null
+  const attention = snapshot.attention.filter((id) => id !== currentId)
+  const ready = loaded.key === requestKey && (loaded.content || loaded.error)
+  const legacy = authMode === 'legacy'
 
   return (
     <div className={`dashboard ${sidebarOpen ? 'sidebar-visible' : ''}`}>
@@ -1450,86 +438,213 @@ export default function Dashboard() {
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
         <NotesSidebar
           notes={visibleNotes}
-          activeNoteId={activeNoteId}
-          onSelectNote={(id) => {
-            if (trashView) handleCloseTrash()
-            setEditorShouldAutoFocus(false)
-            setActiveNoteContent(null)
-            setActiveNoteContentId(null)
-            setActiveNoteLoading(true)
-            setActiveNoteId(id)
-            if (window.innerWidth <= 768) setSidebarOpen(false)
-          }}
+          activeNoteId={currentId}
+          onSelectNote={selectNote}
           onNewNote={handleNewNote}
-          onDeleteNote={handleSoftDeleteNote}
+          onDeleteNote={handleTrash}
           searchQuery={searchQuery}
           setSearchQuery={setSearchQuery}
-          loading={notesLoading}
+          loading={snapshot.status === 'loading' || snapshot.status === 'idle'}
           trashView={trashView}
-          trashNotes={trashNotes}
-          trashLoading={trashLoading}
-          onOpenTrash={handleOpenTrash}
-          onCloseTrash={handleCloseTrash}
-          onRestoreNote={handleRestoreNote}
-          onPermanentDelete={handlePermanentDelete}
-          onSelectTrashNote={(id) => {
-            setActiveTrashNoteContent(null)
-            setActiveTrashNoteContentId(null)
-            setActiveTrashNoteLoading(true)
-            setActiveTrashNoteId(id)
+          trashNotes={snapshot.trash}
+          trashLoading={trashView && !snapshot.trashLoaded}
+          onOpenTrash={() => {
+            editorRef.current?.flush()
+            setTrashView(true)
+            setActiveTrashId(null)
+            store?.loadTrash().catch((error) => toast.error(error.message || 'Failed to load trash'))
           }}
-          activeTrashNoteId={activeTrashNoteId}
-          searchStatus={searchStatus}
+          onCloseTrash={() => setTrashView(false)}
+          onRestoreNote={handleRestore}
+          onPermanentDelete={(id) => setPendingDelete(id)}
+          onSelectTrashNote={setActiveTrashId}
+          activeTrashNoteId={activeTrashId}
+          searchStatus={snapshot.search}
+          saveStates={snapshot.saveStates}
         />
       </aside>
 
       <main className="editor-area">
-        {trashView ? (
-          activeTrashNoteSummary ? (
-            activeTrashNoteLoading || !activeTrashNote?.content ? (
-              <div className="empty-state editor-loading-state">
-                <div className="loader" />
-                <p>Loading note...</p>
+        {sessionExpired && <SessionExpiredBanner />}
+        {snapshot.error && snapshot.status === 'ready' && (
+          <div className="banner banner-warn" role="status">
+            <AlertTriangle size={16} />
+            <div className="banner-body">
+              <strong>Showing notes saved on this device.</strong>
+              <span>The server could not be reached: {snapshot.error}</span>
+            </div>
+          </div>
+        )}
+        {legacy && (
+          <div className="banner banner-warn">
+            <AlertTriangle size={16} />
+            <div className="banner-body">
+              <strong>Your notes are not end-to-end encrypted yet.</strong>
+              <div className="banner-actions">
+                <button type="button" className="btn-primary" onClick={() => setUpgradeDeferred(false)}>
+                  Upgrade now
+                </button>
               </div>
-            ) : (
-              <Suspense fallback={null}>
-                <NoteEditor
-                  key={activeTrashNote.id}
-                  note={activeTrashNote}
-                  onUpdate={() => {}}
-                  onUploadImage={handleUploadImage}
-                  resolveImageSrc={resolveEncryptedBlobUrl}
-                  readOnly
-                />
-              </Suspense>
-            )
-          ) : (
+            </div>
+          </div>
+        )}
+        {attention.length > 0 && (
+          <div className="banner banner-warn">
+            <AlertTriangle size={16} />
+            <div className="banner-body">
+              <strong>
+                {attention.length === 1 ? 'A note has' : `${attention.length} notes have`} unsaved changes that need your
+                decision.
+              </strong>
+              <div className="banner-actions">
+                <button type="button" className="btn-link" onClick={() => selectNote(attention[0])}>
+                  Review
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {trashView ? (
+          activeTrashId == null ? (
             <div className="empty-state">
               <FileText size={48} />
-              <p>Select a note from the sidebar to preview</p>
+              <p>Select a note from the trash to preview it</p>
             </div>
-          )
-        ) : notesLoading ? (
-          <div className="empty-state">
-            <div className="loader" />
-          </div>
-        ) : activeNoteSummary ? (
-          activeNoteLoading || !activeNote?.content ? (
+          ) : !ready ? (
             <div className="empty-state editor-loading-state">
               <div className="loader" />
               <p>Loading note...</p>
             </div>
+          ) : loaded.error ? (
+            <NoteProblem diagnostic={loaded.error.diagnostic || { message: loaded.error.message }} />
           ) : (
-            <Suspense fallback={null}>
-              <NoteEditor
-                key={activeNote.id}
-                note={activeNote}
-                onUpdate={handleUpdateNote}
-                onUploadImage={handleUploadImage}
-                resolveImageSrc={resolveEncryptedBlobUrl}
-                autoFocus={editorShouldAutoFocus}
-              />
-            </Suspense>
+            <>
+              <div className="editor-meta">
+                <span>In the trash. Restore it to edit.</span>
+                <button type="button" className="btn-ghost" onClick={() => handleRestore(activeTrashId)}>
+                  Restore
+                </button>
+              </div>
+              <Suspense fallback={null}>
+                <NoteEditor
+                  key={`trash:${activeTrashId}:${loaded.token}`}
+                  note={{ content: loaded.content }}
+                  resolveImageSrc={attachments.resolve}
+                  onOpenAttachment={openAttachment}
+                  readOnly
+                />
+              </Suspense>
+            </>
+          )
+        ) : snapshot.status !== 'ready' && !snapshot.notes.length ? (
+          <div className="empty-state">
+            {snapshot.status === 'error' ? (
+              <>
+                <AlertTriangle size={40} />
+                <p>{snapshot.error || 'Failed to load notes'}</p>
+                <button type="button" className="btn-primary" onClick={() => store?.start()}>
+                  Try again
+                </button>
+              </>
+            ) : (
+              <div className="loader" />
+            )}
+          </div>
+        ) : currentId != null && (activeRecord || removedNotice === currentId) ? (
+          !ready ? (
+            <div className="empty-state editor-loading-state">
+              <div className="loader" />
+              <p>Loading note...</p>
+            </div>
+          ) : loaded.error ? (
+            <NoteProblem
+              diagnostic={loaded.error.diagnostic || { message: loaded.error.message }}
+              onShowHistory={() => setHistoryOpen(true)}
+              onTrash={() => handleTrash(currentId)}
+            />
+          ) : (
+            <>
+              {removedNotice === currentId && (
+                <div className="banner banner-error" role="alert">
+                  <AlertTriangle size={16} />
+                  <div className="banner-body">
+                    <strong>This note was deleted on another device.</strong>
+                    <div className="banner-actions">
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        onClick={async () => {
+                          editorRef.current?.flush()
+                          const content = loaded.content
+                          const note = await store.createNote({ content })
+                          setRemovedNotice(null)
+                          setActiveId(note.id)
+                        }}
+                      >
+                        Keep a copy as a new note
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+              {conflict && (
+                <ConflictBanner
+                  conflict={conflict}
+                  onShowHistory={() => setHistoryOpen(true)}
+                  onResolve={async (choice) => {
+                    editorRef.current?.flush()
+                    try {
+                      const created = await store.resolveConflict(currentId, choice)
+                      if (created) {
+                        toast.success('Your version was saved as a new note')
+                      }
+                    } catch (error) {
+                      toast.error(error.message)
+                    }
+                  }}
+                />
+              )}
+              {loaded.rollback && (
+                <div className="banner banner-warn" role="alert">
+                  <AlertTriangle size={16} />
+                  <div className="banner-body">
+                    <strong>The server returned an older version of this note than this device has seen.</strong>
+                    <span>
+                      Revision {loaded.rollback.served} was served after revision {loaded.rollback.seen}. Check the
+                      history before editing.
+                    </span>
+                  </div>
+                </div>
+              )}
+              <div className="editor-meta">
+                <SaveStatus
+                  state={editorDirty && (!saveState || saveState.state === 'saved') ? 'pending' : saveState?.state || 'saved'}
+                  error={saveState?.error}
+                  onRetry={() => store.retry(currentId)}
+                />
+                {!legacy && (
+                  <button type="button" className="btn-ghost" onClick={() => setHistoryOpen(true)} title="Version history">
+                    <History size={16} /> History
+                  </button>
+                )}
+              </div>
+              <EditorErrorBoundary key={`${currentId}:${loaded.token}`}>
+                <Suspense fallback={null}>
+                  <NoteEditor
+                    ref={editorRef}
+                    note={{ content: loaded.content }}
+                    onChange={handleChange}
+                    onDirtyChange={setEditorDirty}
+                    onUploadFile={uploadForEditor}
+                    resolveImageSrc={attachments.resolve}
+                    onOpenAttachment={openAttachment}
+                    maxUploadBytes={limits?.maxBlobBytes}
+                    autoFocus={autoFocus}
+                  />
+                </Suspense>
+              </EditorErrorBoundary>
+            </>
           )
         ) : (
           <div className="empty-state">
@@ -1541,6 +656,26 @@ export default function Dashboard() {
           </div>
         )}
       </main>
+
+      {store && !legacy && (
+        <HistoryModal
+          isOpen={historyOpen}
+          noteId={currentId}
+          store={store}
+          resolveImageSrc={attachments.resolve}
+          onClose={() => setHistoryOpen(false)}
+        />
+      )}
+
+      <ConfirmDialog
+        isOpen={pendingDelete != null}
+        title="Delete permanently?"
+        message="This note and its history will be deleted from the server. This cannot be undone."
+        confirmLabel="Delete permanently"
+        danger
+        onConfirm={confirmPermanentDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
     </div>
   )
 }

@@ -2,22 +2,19 @@ import { useState } from 'react'
 import toast from 'react-hot-toast'
 import { useAuth } from '../context/AuthContext.jsx'
 
-// Rendered whenever AuthContext's `vaultLocked` is true — i.e. we're
-// authenticated but there is no vault key in memory yet: a vault exists,
-// just not open in this browser (fresh device or an explicit lock).
+// Authenticated, but the vault key is not in memory (reload, auto-lock or a
+// manual lock). Unsent edits wait, encrypted, in the outbox.
 export default function VaultUnlockScreen() {
-  const { user, logout, unlockVault } = useAuth()
+  const { user, logout, unlock, lockNotice } = useAuth()
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
   async function handleUnlockSubmit(e) {
     e.preventDefault()
     setSubmitting(true)
-
     try {
-      await unlockVault(password)
+      await unlock(password)
       setPassword('')
-      toast.success('Vault unlocked')
     } catch (error) {
       toast.error(error.message)
     } finally {
@@ -25,20 +22,22 @@ export default function VaultUnlockScreen() {
     }
   }
 
-  // ── Ordinary lock: a vault already exists, just not open here ──────────
   return (
     <div className="vault-lock-screen">
       <div className="vault-lock-card">
         <h1>Unlock Notes</h1>
+        {lockNotice && <p className="vault-lock-notice">{lockNotice}</p>}
         <p>
-          Your session is active for <strong>{user?.email}</strong>, but your encrypted vault stays
-          locked until you re-enter your password.
+          Signed in as <strong>{user?.email}</strong>. Your notes stay encrypted until you enter your password on this
+          device.
         </p>
         <form onSubmit={handleUnlockSubmit}>
           <div className="form-group">
-            <label>Password</label>
+            <label htmlFor="unlock-password">Password</label>
             <input
+              id="unlock-password"
               type="password"
+              autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
@@ -47,7 +46,7 @@ export default function VaultUnlockScreen() {
           </div>
           <div className="vault-lock-actions">
             <button type="submit" className="btn-primary" disabled={submitting}>
-              {submitting ? 'Unlocking...' : 'Unlock Vault'}
+              {submitting ? 'Unlocking...' : 'Unlock'}
             </button>
             <button type="button" className="btn-ghost" onClick={logout}>
               Sign Out
@@ -55,7 +54,7 @@ export default function VaultUnlockScreen() {
           </div>
         </form>
         <p className="vault-lock-help">
-          If you forgot the password, sign out and use the recovery key flow from the login page.
+          Forgot the password? Sign out and choose &ldquo;Use recovery key instead&rdquo; on the login page.
         </p>
       </div>
     </div>

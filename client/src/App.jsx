@@ -9,11 +9,15 @@ const Login = lazy(() => import('./pages/Login.jsx'))
 const Signup = lazy(() => import('./pages/Signup.jsx'))
 const Dashboard = lazy(() => import('./pages/Dashboard.jsx'))
 const Landing = lazy(() => import('./pages/Landing.jsx'))
+const LegacyUpgradeScreen = lazy(() => import('./components/LegacyUpgradeScreen.jsx'))
 
 function HomeRoute() {
-  const { user, loading } = useAuth()
+  const { user, loading, authMode, upgradeDeferred } = useAuth()
   if (loading) return null
   if (!user) return <PageTransition><Landing /></PageTransition>
+  // Pre-encryption accounts are offered the upgrade first (DATA-5: never a
+  // forced logout if it fails or is postponed).
+  if (authMode === 'legacy' && !upgradeDeferred) return <PageTransition><LegacyUpgradeScreen /></PageTransition>
   return <PageTransition><Dashboard /></PageTransition>
 }
 

@@ -1,117 +1,136 @@
 import express, { Router } from 'express';
-import pool from '../db.js';
-import { authenticateToken } from '../middleware/auth.js';
-import {
-  buildBlobFilename,
-  deleteFileIfExists,
-  readBlobFile,
-  writeBlobFile,
-} from '../utils/blobStore.js';
+import { pipeline } from 'stream';
+import { z } from 'zod';
+import { badRequest } from '../lib/errors.js';
+import { base64DecodedLength, idListSchema, idSchema, KEY_ID_RE, parseBody } from '../lib/validation.js';
+import { gcStatus, findBlob, reconcileRefs, requestBlobDeletion, storageUsage, uploadBlob } from '../services/blobs.js';
 
-const router = Router();
+const reconcileSchema = z.strictObject({
+  notes: z
+    .array(z.strictObject({ id: idSchema, revision: z.number().int().min(0), blobIds: idListSchema }))
+    .max(2000)
+    .default([]),
+  revisions: z.array(z.strictObject({ id: idSchema, blobIds: idListSchema })).max(5000).default([]),
+  // profileIv: the IV of the profile envelope the client decrypted.
+  profile: z.strictObject({ blobId: idSchema.nullable(), profileIv: z.string().max(64).nullable() }).optional(),
+});
 
-router.use(authenticateToken);
-
-router.post('/', express.raw({ type: 'application/octet-stream', limit: '25mb' }), async (req, res) => {
-  try {
-    const iv = req.headers['x-blob-iv'];
-    const kind = req.headers['x-blob-kind'];
-    const mimeType = req.headers['x-blob-mime-type'] || 'application/octet-stream';
-    const algorithm = req.headers['x-blob-algorithm'] || 'AES-256-GCM';
-    const version = parseInt(req.headers['x-blob-version'] || '1', 10);
-    const payload = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || []);
-
-    if (!iv || !kind || payload.length === 0) {
-      return res.status(400).json({ error: 'Missing blob metadata or payload' });
+function parseUploadHeaders(req) {
+  const version = Number(req.get('x-blob-version') || '1');
+  if (![2, 3].includes(version)) {
+    throw badRequest('Unsupported blob format version', 'INVALID_BLOB');
+  }
+  const iv = req.get('x-blob-iv') || null;
+  const keyId = req.get('x-blob-key-id') || null;
+  if (version === 2 && base64DecodedLength(iv) !== 12) {
+    throw badRequest('Version 2 blobs need a 12-byte IV header', 'INVALID_BLOB');
+  }
+  if (version === 3) {
+    // v3 blobs carry per-chunk IVs inline and must name their key.
+    if (!keyId || !KEY_ID_RE.test(keyId)) {
+      throw badRequest('Version 3 blobs need a key id', 'INVALID_BLOB');
     }
+  }
+  const replacesHeader = req.get('x-blob-replaces');
+  const replaces = replacesHeader ? idSchema.parse(replacesHeader) : null;
+  return { version, iv: version === 2 ? iv : null, keyId: version === 3 ? keyId : null, replaces };
+}
 
-    const insert = await pool.query(
-      `
-        INSERT INTO blobs (
-          user_id,
-          kind,
-          mime_type,
-          byte_length,
-          storage_path,
-          envelope_iv,
-          envelope_algorithm,
-          envelope_version
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING *
-      `,
-      [req.user.id, kind, mimeType, payload.length, '', iv, algorithm, version]
-    );
+export function createBlobsRouter(ctx) {
+  const { pool, config, storage, limiters, requireSession } = ctx;
+  const router = Router();
+  const json = express.json({ limit: config.limits.notesBodyBytes });
 
-    const blob = insert.rows[0];
-    const filename = buildBlobFilename(req.user.id, blob.id);
-    const storagePath = await writeBlobFile(filename, payload);
+  router.use(requireSession, limiters.api);
 
-    await pool.query('UPDATE blobs SET storage_path = $1 WHERE id = $2 AND user_id = $3', [
-      storagePath,
-      blob.id,
-      req.user.id,
-    ]);
-
+  // Legacy accounts upload here too while migrating to encryption.
+  router.post('/', async (req, res) => {
+    if (!req.is('application/octet-stream')) {
+      throw badRequest('Uploads must be sent as application/octet-stream', 'UNSUPPORTED_MEDIA_TYPE');
+    }
+    const meta = parseUploadHeaders(req);
+    const blob = await uploadBlob({ pool, storage, config, user: req.user, req, meta });
     res.status(201).json({
       blob: {
         id: blob.id,
-        kind: blob.kind,
         byteLength: blob.byte_length,
-        mimeType: blob.mime_type,
         version: blob.envelope_version,
+        keyId: blob.key_id,
       },
     });
-  } catch (error) {
-    console.error('Blob upload error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+  });
 
-router.get('/:id', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM blobs WHERE id = $1 AND user_id = $2', [
-      req.params.id,
-      req.user.id,
+  router.get('/usage', async (req, res) => {
+    const usage = await storageUsage(pool, req.user.id);
+    res.json({
+      usedBytes: usage.bytes,
+      blobCount: usage.count,
+      quotaBytes: config.limits.userQuotaBytes || null,
+      maxBlobBytes: config.limits.maxBlobBytes,
+      gc: await gcStatus(pool, req.user.id),
+    });
+  });
+
+  // What the client still has to scan before garbage collection can run.
+  router.get('/refs/unknown', async (req, res) => {
+    const [notes, revisions, user] = await Promise.all([
+      pool.query('SELECT id, revision FROM notes WHERE user_id = $1 AND NOT blob_refs_known ORDER BY id LIMIT 5000', [
+        req.user.id,
+      ]),
+      pool.query(
+        'SELECT id, note_id FROM note_revisions WHERE user_id = $1 AND NOT blob_refs_known ORDER BY id LIMIT 5000',
+        [req.user.id]
+      ),
+      pool.query('SELECT profile_ref_known FROM users WHERE id = $1', [req.user.id]),
     ]);
+    res.json({
+      notes: notes.rows,
+      revisions: revisions.rows.map((row) => ({ id: row.id, noteId: row.note_id })),
+      profileRefKnown: Boolean(user.rows[0]?.profile_ref_known),
+    });
+  });
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Blob not found' });
+  router.post('/refs/reconcile', json, async (req, res) => {
+    const body = parseBody(reconcileSchema, req.body);
+    res.json(await reconcileRefs(pool, req.user, body));
+  });
+
+  router.get('/:id', async (req, res) => {
+    const blob = await findBlob(pool, req.user, idSchema.parse(req.params.id));
+    const info = blob.storage_key ? await storage.stat(blob.storage_key) : null;
+    if (!info) {
+      console.error(`[blobs] file missing for blob ${blob.id} (key ${blob.storage_key})`);
+      res.status(404).json({ error: 'The file for this attachment is missing', code: 'BLOB_FILE_MISSING' });
+      return;
     }
-
-    const blob = result.rows[0];
-    const buffer = await readBlobFile(blob.storage_path);
 
     res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('X-Blob-IV', blob.envelope_iv);
+    res.setHeader('Content-Length', String(info.size));
+    res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('X-Blob-Algorithm', blob.envelope_algorithm);
     res.setHeader('X-Blob-Version', String(blob.envelope_version));
-    res.setHeader('X-Blob-Mime-Type', blob.mime_type || 'application/octet-stream');
-    res.setHeader('X-Blob-Kind', blob.kind);
-    res.send(buffer);
-  } catch (error) {
-    console.error('Blob read error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-router.delete('/:id', async (req, res) => {
-  try {
-    const result = await pool.query(
-      'DELETE FROM blobs WHERE id = $1 AND user_id = $2 RETURNING storage_path',
-      [req.params.id, req.user.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Blob not found' });
+    if (blob.envelope_iv) {
+      res.setHeader('X-Blob-IV', blob.envelope_iv);
+    }
+    if (blob.key_id) {
+      res.setHeader('X-Blob-Key-Id', blob.key_id);
     }
 
-    await deleteFileIfExists(result.rows[0].storage_path);
-    res.json({ message: 'Blob deleted' });
-  } catch (error) {
-    console.error('Blob delete error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+    // Streamed instead of read into memory.
+    await new Promise((resolve) => {
+      pipeline(storage.createReadStream(blob.storage_key), res, (error) => {
+        if (error && error.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+          console.error(`[blobs] stream error for blob ${blob.id}:`, error.message);
+        }
+        resolve();
+      });
+    });
+  });
 
-export default router;
+  router.delete('/:id', async (req, res) => {
+    await requestBlobDeletion(pool, req.user, idSchema.parse(req.params.id));
+    res.status(202).json({ message: 'Scheduled for deletion once unused' });
+  });
+
+  return router;
+}

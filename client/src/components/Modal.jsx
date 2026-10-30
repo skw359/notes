@@ -1,11 +1,15 @@
 import { useEffect, useState } from 'react'
 
+// `dismissible={false}` disables the backdrop click and Escape: used where
+// closing by accident would lose something (the recovery key, CRYPTO-4).
 export default function Modal({
   isOpen,
   onClose,
   children,
   contentClassName = '',
   overlayClassName = '',
+  dismissible = true,
+  labelledBy,
 }) {
   const [visible, setVisible] = useState(false)
   const [closing, setClosing] = useState(false)
@@ -39,20 +43,38 @@ export default function Modal({
     }
   }, [isOpen, visible])
 
+  useEffect(() => {
+    if (!visible || !dismissible) {
+      return undefined
+    }
+    function handleKey(event) {
+      if (event.key === 'Escape') {
+        onClose?.()
+      }
+    }
+    window.addEventListener('keydown', handleKey)
+    return () => window.removeEventListener('keydown', handleKey)
+  }, [dismissible, onClose, visible])
+
   if (!visible) return null
 
   function handleClose() {
-    onClose()
+    onClose?.()
   }
 
   return (
     <div
       className={['modal-overlay', closing ? 'closing' : '', overlayClassName].filter(Boolean).join(' ')}
       onClick={(e) => {
-        if (e.target === e.currentTarget) handleClose()
+        if (dismissible && e.target === e.currentTarget) handleClose()
       }}
     >
-      <div className={['modal-content', contentClassName].filter(Boolean).join(' ')}>
+      <div
+        className={['modal-content', contentClassName].filter(Boolean).join(' ')}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={labelledBy}
+      >
         {typeof children === 'function' ? children(handleClose) : children}
       </div>
     </div>

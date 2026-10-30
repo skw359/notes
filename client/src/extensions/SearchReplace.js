@@ -4,45 +4,53 @@ import { Decoration, DecorationSet } from '@tiptap/pm/view'
 
 const searchReplaceKey = new PluginKey('searchReplace')
 
-function findMatches(doc, searchTerm) {
+// Matches within one run of adjacent text nodes. Any other inline node (a
+// hard break, an image) ends the run, so a match can never span it and
+// "Replace all" can no longer delete line breaks.
+function matchesInRun(segments, term, results) {
+  if (!segments.length) return
+  const lower = segments.map((seg) => seg.text).join('').toLowerCase()
+  let idx = 0
+  while ((idx = lower.indexOf(term, idx)) !== -1) {
+    // Map string offset back to document positions
+    let charsSeen = 0
+    let fromPos = 0
+    let toPos = 0
+    for (const seg of segments) {
+      const segEnd = charsSeen + seg.text.length
+      if (fromPos === 0 && idx < segEnd) {
+        fromPos = seg.from + (idx - charsSeen)
+      }
+      const matchEnd = idx + term.length
+      if (matchEnd <= segEnd) {
+        toPos = seg.from + (matchEnd - charsSeen)
+        break
+      }
+      charsSeen = segEnd
+    }
+    if (fromPos && toPos) {
+      results.push({ from: fromPos, to: toPos })
+    }
+    idx += 1
+  }
+}
+
+export function findMatches(doc, searchTerm) {
   if (!searchTerm) return []
   const results = []
   const term = searchTerm.toLowerCase()
   doc.descendants((node, pos) => {
     if (!node.isTextblock) return
-    // Concatenate all inline text in this block with position tracking
-    let fullText = ''
-    const segments = []
+    let run = []
     node.forEach((child, offset) => {
       if (child.isText) {
-        segments.push({ from: pos + 1 + offset, text: child.text })
-        fullText += child.text
+        run.push({ from: pos + 1 + offset, text: child.text })
+      } else {
+        matchesInRun(run, term, results)
+        run = []
       }
     })
-    const lower = fullText.toLowerCase()
-    let idx = 0
-    while ((idx = lower.indexOf(term, idx)) !== -1) {
-      // Map string offset back to document positions
-      let charsSeen = 0
-      let fromPos = 0
-      let toPos = 0
-      for (const seg of segments) {
-        const segEnd = charsSeen + seg.text.length
-        if (fromPos === 0 && idx < segEnd) {
-          fromPos = seg.from + (idx - charsSeen)
-        }
-        const matchEnd = idx + term.length
-        if (matchEnd <= segEnd) {
-          toPos = seg.from + (matchEnd - charsSeen)
-          break
-        }
-        charsSeen = segEnd
-      }
-      if (fromPos && toPos) {
-        results.push({ from: fromPos, to: toPos })
-      }
-      idx += 1
-    }
+    matchesInRun(run, term, results)
   })
   return results
 }

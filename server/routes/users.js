@@ -1,157 +1,156 @@
 import { Router } from 'express';
-import multer from 'multer';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import pool from '../db.js';
-import { authenticateToken } from '../middleware/auth.js';
-import { deleteFileIfExists, resolveLegacyUploadPath } from '../utils/blobStore.js';
-import { extractLegacyFilenamesFromContent } from '../utils/legacy.js';
+import { z } from 'zod';
+import { lockUserNotes, withTransaction } from '../db.js';
+import { badRequest, conflict, notFound } from '../lib/errors.js';
+import { quarantineLegacyFile } from '../lib/legacyUploads.js';
+import { clearSessionCookie } from '../lib/sessions.js';
+import { idSchema, parseBody, parseProfileEnvelope, verifierSchema } from '../lib/validation.js';
+import { currentVaultKeyId, findUserById, requireCurrentCredentials } from '../services/accounts.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-const storage = multer.diskStorage({
-  destination: path.join(__dirname, '..', 'uploads'),
-  filename: (req, file, cb) => {
-    const uniqueName = `${req.user.id}-${Date.now()}${path.extname(file.originalname)}`;
-    cb(null, uniqueName);
-  },
+const e2eeProfileSchema = z.strictObject({
+  encryptedProfile: z.unknown(),
+  // The blob holding the (encrypted) profile picture, so the collector keeps
+  // it. Omitted by pre-2.0 clients, which leaves the reference unknown.
+  profileBlobId: idSchema.nullable().optional(),
+  // Pre-2.0 clients asked the server to delete the old picture immediately;
+  // the collector handles that now.
+  previousProfilePictureBlobId: z.union([idSchema, z.string()]).nullable().optional(),
 });
 
-const upload = multer({
-  storage,
-  fileFilter: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (ext === '.jpg' || ext === '.jpeg') {
-      cb(null, true);
-    } else {
-      cb(new Error('Only JPG files are allowed'));
-    }
-  },
-  limits: { fileSize: 5 * 1024 * 1024 },
+const legacyProfileSchema = z.strictObject({
+  first_name: z.string().trim().max(100).optional(),
+  last_name: z.string().trim().max(100).optional(),
 });
 
-const router = Router();
+const deleteAccountSchema = z.strictObject({
+  confirm: z.literal('DELETE'),
+  currentAuthSecret: verifierSchema.optional(),
+  password: z.string().min(1).max(1024).optional(),
+});
 
-router.use(authenticateToken);
+export function createUsersRouter(ctx) {
+  const { pool, config, storage, limiters, requireSession } = ctx;
+  const router = Router();
 
-function maybeHandleLegacyUpload(req, res, next) {
-  if (!req.is('multipart/form-data')) {
-    return next();
-  }
+  router.use(requireSession);
 
-  return upload.single('profile_picture')(req, res, next);
-}
-
-async function getUserRecord(userId) {
-  const result = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
-  return result.rows[0] || null;
-}
-
-router.put('/profile', maybeHandleLegacyUpload, async (req, res) => {
-  try {
-    const user = await getUserRecord(req.user.id);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+  router.put('/profile', limiters.api, async (req, res) => {
+    if (req.is('multipart/form-data')) {
+      throw badRequest('Profile picture uploads for unencrypted accounts were removed', 'UNSUPPORTED');
     }
 
-    if (user.auth_mode === 'e2ee') {
-      const { encryptedProfile, previousProfilePictureBlobId } = req.body;
-      if (!encryptedProfile) {
-        return res.status(400).json({ error: 'Encrypted profile is required' });
+    if (req.user.authMode === 'e2ee') {
+      const body = parseBody(e2eeProfileSchema, req.body);
+      const encryptedProfile = parseProfileEnvelope(body.encryptedProfile);
+      const keyId = await currentVaultKeyId(pool, req.user.id);
+      if (keyId && encryptedProfile.version === 3 && encryptedProfile.keyId !== keyId) {
+        throw conflict('The encryption key changed on another device. Unlock again to continue.', 'KEY_ROTATED');
       }
 
-      await pool.query(
-        `
-          UPDATE users
-          SET encrypted_profile = $1, updated_at = NOW()
-          WHERE id = $2
-        `,
-        [JSON.stringify(encryptedProfile), req.user.id]
-      );
-
-      if (previousProfilePictureBlobId) {
-        const blobResult = await pool.query(
-          'SELECT id, storage_path FROM blobs WHERE id = $1 AND user_id = $2',
-          [previousProfilePictureBlobId, req.user.id]
-        );
-
-        if (blobResult.rows.length > 0) {
-          await deleteFileIfExists(blobResult.rows[0].storage_path);
-          await pool.query('DELETE FROM blobs WHERE id = $1 AND user_id = $2', [
-            previousProfilePictureBlobId,
+      await withTransaction(pool, async (db) => {
+        await lockUserNotes(db, req.user.id);
+        let profileBlobId = null;
+        if (body.profileBlobId) {
+          const owned = await db.query('SELECT id FROM blobs WHERE id = $1 AND user_id = $2', [
+            body.profileBlobId,
             req.user.id,
           ]);
+          if (!owned.rows.length) {
+            throw notFound('Profile picture not found', 'BLOB_NOT_FOUND');
+          }
+          profileBlobId = owned.rows[0].id;
+          await db.query('UPDATE blobs SET unreferenced_since = NULL WHERE id = $1', [profileBlobId]);
         }
-      }
 
-      return res.json({ ok: true });
+        const knowsReference = body.profileBlobId !== undefined;
+        await db.query(
+          `
+            UPDATE users SET
+              encrypted_profile = $2,
+              profile_blob_id = CASE WHEN $3 THEN $4 ELSE profile_blob_id END,
+              profile_ref_known = $3,
+              updated_at = NOW()
+            WHERE id = $1
+          `,
+          [req.user.id, JSON.stringify(encryptedProfile), knowsReference, profileBlobId]
+        );
+      });
+
+      res.json({ ok: true });
+      return;
     }
 
-    const { first_name, last_name } = req.body;
-    const updates = [];
-    const values = [];
-    let paramIndex = 1;
-
-    if (first_name) {
-      updates.push(`first_name = $${paramIndex++}`);
-      values.push(first_name);
+    const body = parseBody(legacyProfileSchema, req.body);
+    if (!body.first_name && !body.last_name) {
+      throw badRequest('No fields to update');
     }
-    if (last_name) {
-      updates.push(`last_name = $${paramIndex++}`);
-      values.push(last_name);
-    }
-    if (req.file) {
-      updates.push(`profile_picture = $${paramIndex++}`);
-      values.push(req.file.filename);
-    }
-
-    if (updates.length === 0) {
-      return res.status(400).json({ error: 'No fields to update' });
-    }
-
-    updates.push(`updated_at = NOW()`);
-    values.push(req.user.id);
-
     const result = await pool.query(
-      `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING id, email, first_name, last_name, profile_picture, created_at`,
-      values
+      `
+        UPDATE users SET
+          first_name = COALESCE(NULLIF($2, ''), first_name),
+          last_name = COALESCE(NULLIF($3, ''), last_name),
+          updated_at = NOW()
+        WHERE id = $1 AND auth_mode = 'legacy'
+        RETURNING id, email, first_name, last_name, profile_picture, created_at
+      `,
+      [req.user.id, body.first_name ?? '', body.last_name ?? '']
     );
+    res.json({ user: { ...result.rows[0], auth_mode: 'legacy' } });
+  });
 
-    res.json({ user: result.rows[0] });
-  } catch (err) {
-    console.error('Profile update error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+  // SEC-6: irreversible, so it needs the current password (not just the
+  // cookie) and a typed confirmation. Rows are deleted in one transaction
+  // first; files are moved afterwards (blobs to the deleted-files area,
+  // legacy plaintext to quarantine) and failures there are only logged.
+  router.delete('/account', limiters.sensitive, async (req, res) => {
+    const body = parseBody(deleteAccountSchema, req.body);
+    const user = await findUserById(pool, req.user.id);
+    if (!user) {
+      throw notFound('User not found', 'USER_NOT_FOUND');
+    }
+    await requireCurrentCredentials(ctx, user, {
+      currentAuthSecret: body.currentAuthSecret,
+      password: body.password,
+    });
 
-router.delete('/account', async (req, res) => {
-  try {
-    const legacyFiles = new Set();
-    const noteResult = await pool.query('SELECT content FROM notes WHERE user_id = $1', [req.user.id]);
-    for (const row of noteResult.rows) {
-      for (const filename of extractLegacyFilenamesFromContent(row.content)) {
-        legacyFiles.add(filename);
+    const { blobKeys, legacyFiles } = await withTransaction(pool, async (db) => {
+      await lockUserNotes(db, user.id);
+      const blobs = await db.query('SELECT storage_key FROM blobs WHERE user_id = $1', [user.id]);
+      const files = await db.query(
+        'SELECT filename FROM legacy_uploads WHERE user_id = $1 AND quarantined_at IS NULL',
+        [user.id]
+      );
+      await db.query('DELETE FROM users WHERE id = $1', [user.id]);
+      return {
+        blobKeys: blobs.rows.map((row) => row.storage_key).filter(Boolean),
+        legacyFiles: files.rows.map((row) => row.filename),
+      };
+    });
+
+    let fileErrors = 0;
+    for (const key of blobKeys) {
+      try {
+        await storage.moveToDeleted(key);
+      } catch (error) {
+        fileErrors += 1;
+        console.error(`[account-delete] could not move blob file ${key}:`, error.message);
       }
     }
-
-    const user = await getUserRecord(req.user.id);
-    if (user?.profile_picture) {
-      legacyFiles.add(user.profile_picture);
+    for (const filename of legacyFiles) {
+      try {
+        await quarantineLegacyFile(config.storage, filename);
+      } catch (error) {
+        fileErrors += 1;
+        console.error(`[account-delete] could not quarantine ${filename}:`, error.message);
+      }
+    }
+    if (fileErrors) {
+      console.error(`[account-delete] user ${user.id}: ${fileErrors} file(s) left for verify-storage to clean up`);
     }
 
-    const blobResult = await pool.query('SELECT storage_path FROM blobs WHERE user_id = $1', [req.user.id]);
-    await Promise.all(blobResult.rows.map((blob) => deleteFileIfExists(blob.storage_path)));
-    await Promise.all(
-      [...legacyFiles].map((filename) => deleteFileIfExists(resolveLegacyUploadPath(filename)))
-    );
-
-    await pool.query('DELETE FROM users WHERE id = $1', [req.user.id]);
-    res.clearCookie('token');
+    clearSessionCookie(res, req, config);
     res.json({ message: 'Account deleted' });
-  } catch (err) {
-    console.error('Account delete error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
+  });
 
-export default router;
+  return router;
+}
